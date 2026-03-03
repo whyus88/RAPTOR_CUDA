@@ -48,26 +48,24 @@ __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Jx[4];
 __constant__ uint64_t c_Jy[4];
 
-// MODIFIKASI: Tambahkan panjang target (dalam byte) untuk vanity search
+// MODIFIKASI: Variabel global device untuk panjang target
 __device__ __constant__ int c_target_len;
 
-// Helper device function untuk vanity check
+// Helper device function untuk vanity check (prefix matching)
 __device__ __forceinline__ bool check_vanity_match(
     const uint8_t* __restrict__ h, 
     const uint8_t* __restrict__ target, 
     int len,
     uint32_t target_prefix_u32) 
 {
-    // Optimisasi: Jika len >= 4, cek 4 byte pertama dengan cepat
+    // Optimisasi: Jika len >= 4, cek 4 byte pertama dengan cepat (uint32 compare)
     if (len >= 4) {
-        // load_u32_le diasumsikan ada di CUDA_Utils.h atau implementasi lokal
-        // Implementasi sederhana load little endian 32-bit
         uint32_t h_prefix = (uint32_t)h[0] | ((uint32_t)h[1] << 8) | ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 24);
         if (h_prefix != target_prefix_u32) return false;
     }
 
     // Cek byte per byte untuk panjang yang diminta
-    // Unroll loop untuk performa
+    // Loop unroll manual atau pragma unroll biasanya efektif di sini
     for (int k = 0; k < 20; ++k) {
         if (k < len) {
             if (h[k] != target[k]) return false;
@@ -105,7 +103,7 @@ __global__ void kernel_point_add_and_check_oneinv(
     if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
     const uint32_t target_prefix = c_target_prefix;
-    const int target_len = c_target_len; // Load panjang target
+    const int target_len = c_target_len;
 
     unsigned int local_hashes = 0;
     #define FLUSH_THRESHOLD 65536u
@@ -139,19 +137,14 @@ __global__ void kernel_point_add_and_check_oneinv(
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
-        // BLOK PENCEKAN 1: Titik Saat Ini (Base Point)
+        // --- CEK TITIK PUSAT (BASE POINT) ---
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            // MODIFIKASI: Gunakan logika vanity check
             bool match = check_vanity_match(h20, c_target_hash160, target_len, target_prefix);
-            
-            // Optimisasi warp jika ada salah satu thread yang match (untuk memicu sync)
-            // Catatan: Untuk vanity, __any_sync bisa sering terpicu jika prefix pendek, 
-            // tapi di sini kita hanya exit jika match sempurna (FOUND_READY).
             if (match) {
                 if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                     d_found_result->threadId = (int)gid;
@@ -169,9 +162,11 @@ __global__ void kernel_point_add_and_check_oneinv(
             }
         }
 
+        // --- PERSIAPAN BATCH INVERSION ---
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
+        // Menghitung akumulator untuk inversi massal
 #pragma unroll
         for (int j=0;j<4;++j) acc[j] = c_Jx[j];
         ModSub256(acc, acc, x1);
@@ -195,13 +190,13 @@ __global__ void kernel_point_add_and_check_oneinv(
         for (int j=0;j<4;++j) inverse[j] = d0[j];
         _ModMult(inverse, subp[0]);
         inverse[4] = 0ull;
-        _ModInv(inverse);
+        _ModInv(inverse); // Inversi mahal dilakukan sekali saja
 
         uint64_t sy_neg[4], sx_neg[4];
         ModNeg256(sy_neg, y1);
         ModNeg256(sx_neg, x1);
 
-        // Loop Iterasi Batch (Addition Chain)
+        // --- LOOP ITERASI BATCH (Addition Chain) ---
         for (int i = 0; i < half - 1; ++i) {
             if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
@@ -296,6 +291,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
             }
 
+            // Update inverse untuk iterasi berikutnya
             uint64_t gxmi[4];
 #pragma unroll
             for (int j=0;j<4;++j) gxmi[j] = c_Gx[(size_t)i*4 + j];
@@ -303,7 +299,8 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(inverse, inverse, gxmi);
         }
 
-        // Iterasi terakhir (i = half - 1)
+        // --- ITERASI TERAKHIR (i = half - 1) ---
+        // BAGIAN INI YANG KEMUNGKINAN BESAR MENYEBABKAN BUG SEBELUMNYA
         {
             const int i = half - 1;
             uint64_t dx_inv_i[4];
@@ -313,7 +310,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint64_t px_i[4], py_i[4];
 #pragma unroll
             for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
-            ModNeg256(py_i, py_i);
+            ModNeg256(py_i, py_i); // Negasi Y untuk pengurangan
 
             ModSub256(s, py_i, y1);
             _ModMult(lam, s, dx_inv_i);
@@ -347,9 +344,12 @@ __global__ void kernel_point_add_and_check_oneinv(
                     __threadfence_system();
                     atomicExch(d_found_flag, FOUND_READY);
                 }
+                // JIKA KETEMU, RETURN. JIKA TIDAK, JANGAN RETURN!
+                __syncwarp(full_mask); WARP_FLUSH_HASHES(); 
+                return; // Return hanya jika match
             }
-            __syncwarp(full_mask); WARP_FLUSH_HASHES(); return; // Jika match, return di sini
 
+            // Jika tidak match, lanjutkan proses untuk menyiapkan lompatan (Jump)
             uint64_t last_dx[4];
 #pragma unroll
             for (int j=0;j<4;++j) last_dx[j] = c_Gx[(size_t)i*4 + j];
@@ -357,7 +357,8 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(inverse, inverse, last_dx);
         }
 
-        // Lompat ke batch berikutnya (P = P + B*G)
+        // --- BLOK LOMPATAN (JUMP) ---
+        //Tambahkan B*G ke titik saat ini
         {
             uint64_t lam[4], s[4], x3[4], y3[4];
 
@@ -380,6 +381,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             for (int j=0;j<4;++j) { x1[j] = x3[j]; y1[j] = y3[j]; }
         }
 
+        // Update Scalar dan Remaining Count
         {
             uint64_t addv=(uint64_t)B;
             for (int k=0;k<4 && addv;++k){ uint64_t old=S[k]; S[k]=old+addv; addv=(S[k]<old)?1ull:0ull; }
@@ -388,6 +390,7 @@ __global__ void kernel_point_add_and_check_oneinv(
         ++batches_done;
     }
 
+    // Simpan state kembali ke memori global
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         Rx[gid*4+i] = x1[i];
@@ -417,10 +420,12 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
     std::string target_hash_hex, range_hex, address_b58;
+    // Konfigurasi default
     uint32_t runtime_points_batch_size = 128;
     uint32_t runtime_batches_per_sm    = 8;
     uint32_t slices_per_launch         = 64;
 
+    // Parsing Argument (Sama seperti sebelumnya)
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
         if (comma == std::string::npos) return false;
@@ -495,15 +500,13 @@ int main(int argc, char** argv) {
         if (!decode_p2pkh_address(address_b58, target_hash160)) {
             std::cerr << "Error: invalid P2PKH address\n"; return EXIT_FAILURE;
         }
-        target_len = 20; // Address implies full match
+        target_len = 20;
     } else {
-        // MODIFIKASI: Handle partial hash160 (vanity)
+        // Logika Vanity Search
         std::string h_clean = target_hash_hex;
-        // Hapus 0x prefix jika ada
         if (h_clean.size() >= 2 && h_clean[0] == '0' && (h_clean[1] == 'x' || h_clean[1] == 'X')) {
             h_clean = h_clean.substr(2);
         }
-        
         if (h_clean.empty() || h_clean.size() > 40) {
             std::cerr << "Error: target hash160 hex length must be between 1 and 40 chars.\n";
             return EXIT_FAILURE;
@@ -512,20 +515,17 @@ int main(int argc, char** argv) {
             std::cerr << "Error: target hash160 hex must have even length.\n";
             return EXIT_FAILURE;
         }
-
         target_len = h_clean.size() / 2;
-        
-        // Pad dengan 00 di belakang (padding tidak mempengaruhi pengecekan prefix)
         std::string padded_hex = h_clean + std::string(40 - h_clean.size(), '0');
         
         if (!hexToHash160(padded_hex, target_hash160)) {
             std::cerr << "Error: invalid target hash160 hex chars.\n";
             return EXIT_FAILURE;
         }
-        
         std::cout << "Vanity Mode: Searching for Hash160 starting with " << h_clean << " (" << target_len << " bytes)\n";
     }
 
+    // Validasi Batch Size
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
     if (!is_pow2(runtime_points_batch_size) || (runtime_points_batch_size & 1u)) {
         std::cerr << "Error: batch size must be even and a power of two.\n";
@@ -536,8 +536,8 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
+    // Validasi Range
     uint64_t range_len[4]; sub256(range_end, range_start, range_len); add256_u64(range_len, 1ull, range_len);
-
     auto is_zero_256 = [](const uint64_t a[4])->bool { return (a[0]|a[1]|a[2]|a[3]) == 0ull; };
     auto is_power_of_two_256 = [&](const uint64_t a[4])->bool {
         if (is_zero_256(a)) return false;
@@ -568,17 +568,18 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Init CUDA
     int device=0; cudaDeviceProp prop{};
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) {
         std::cerr<<"CUDA init error\n"; return EXIT_FAILURE;
     }
-
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
     int threadsPerBlock=256;
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
     if (threadsPerBlock < 32) threadsPerBlock=32;
 
+    // Kalkulasi Grid & Memory
     const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t);
     size_t totalGlobalMem = prop.totalGlobalMem;
     const uint64_t reserveBytes = 64ull * 1024 * 1024;
@@ -628,6 +629,7 @@ int main(int argc, char** argv) {
         if (rr != 0ull) { std::cerr << "Internal error: per-thread count is not a multiple of batch size.\n"; return EXIT_FAILURE; }
     }
 
+    // Alokasi Host
     uint64_t* h_counts256     = nullptr;
     uint64_t* h_start_scalars = nullptr;
     cudaHostAlloc(&h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
@@ -656,8 +658,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Setup Constant Memory
     {
-        // Hitung prefix untuk optimisasi kernel (hanya jika len >= 4)
         uint32_t prefix_le = 0;
         if (target_len >= 4) {
             prefix_le = (uint32_t)target_hash160[0]
@@ -667,9 +669,10 @@ int main(int argc, char** argv) {
         }
         cudaMemcpyToSymbol(c_target_prefix, &prefix_le, sizeof(prefix_le));
         cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
-        cudaMemcpyToSymbol(c_target_len, &target_len, sizeof(target_len)); // Kirim panjang target
+        cudaMemcpyToSymbol(c_target_len, &target_len, sizeof(target_len));
     }
 
+    // Alokasi Device
     uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
     int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
     unsigned long long *d_hashes_accum=nullptr; unsigned int *d_any_left=nullptr;
@@ -698,6 +701,7 @@ int main(int argc, char** argv) {
       ck(cudaMemcpy(d_found_flag, &zero,   sizeof(int),                cudaMemcpyHostToDevice), "init found_flag");
       ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes_accum"); }
 
+    // Precompute Base Points
     {
         int blocks_scal = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
@@ -759,6 +763,7 @@ int main(int argc, char** argv) {
         cudaFreeHost(h_scalarB);
     }
 
+    // Info
     size_t freeB=0,totalB=0; cudaMemGetInfo(&freeB,&totalB);
     size_t usedB = totalB - freeB;
     double util = totalB ? (double)usedB * 100.0 / (double)totalB : 0.0;
@@ -778,6 +783,7 @@ int main(int argc, char** argv) {
     std::cout << std::left << std::setw(20) << "Total threads"     << " : " << (uint64_t)threadsTotal << "\n\n";
     std::cout << "======== Phase-1: BruteForce ==========================\n";
 
+    // Loop Utama
     cudaStream_t streamKernel;
     ck(cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking), "create stream");
 
@@ -821,16 +827,14 @@ int main(int argc, char** argv) {
                 double mkeys = delta / (dt * 1e6);
                 double elapsed = std::chrono::duration<double>(now - t0).count();
                 
-                // Untuk vanity search, progress % mungkin tidak relevan jika range sangat besar, tapi tetap ditampilkan
                 long double total_keys_ld = ld_from_u256(range_len);
                 long double prog = total_keys_ld > 0.0L ? ((long double)h_hashes / total_keys_ld) * 100.0L : 0.0L;
                 if (prog > 100.0L) prog = 100.0L;
                 
                 std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
                           << " s | Speed: " << std::fixed << std::setprecision(1) << mkeys
-                          << " Mkeys/s | Count: " << h_hashes;
-                          // Hilangkan persentase jika vanity search bisa sangat lama, tapi biarkan untuk informasi
-                          std::cout << " | Progress: " << std::fixed << std::setprecision(4) << (double)prog << " %";
+                          << " Mkeys/s | Count: " << h_hashes
+                          << " | Progress: " << std::fixed << std::setprecision(4) << (double)prog << " %";
                 std::cout.flush();
                 lastHashes = h_hashes; tLast = now;
             }
