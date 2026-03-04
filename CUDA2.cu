@@ -52,13 +52,10 @@ __constant__ int c_vanity_len;
 
 // --- Konstanta Baru untuk Grasshopper Algorithm ---
 __constant__ uint64_t c_RangeStart[4];
-__constant__ uint64_t c_RangeLen[4];
-// Titik P_RangeLen = RangeLen * G (untuk wrap-around)
-__constant__ uint64_t c_P_RangeLen_X[4];
-__constant__ uint64_t c_P_RangeLen_Y[4];
 
 // Helper Device Function untuk Point Addition Affine (Generik)
 // Digunakan untuk wrap-around correction: P = P - P_RangeLen
+// PERBAIKAN: Menggunakan casting (uint64_t*) untuk kompatibilitas dengan CUDAMath.h
 __device__ void pointAddAffineGeneric(
     const uint64_t x1[4], const uint64_t y1[4],
     const uint64_t x2[4], const uint64_t y2[4],
@@ -67,11 +64,11 @@ __device__ void pointAddAffineGeneric(
     // Menghitung lambda = (y2 - y1) * inv(x2 - x1)
     uint64_t dx[4], dy[4], inv_dx[4], lam[4];
     
-    ModSub256(dx, x2, x1);
-    ModSub256(dy, y2, y1);
+    // Cast const away karena CUDAMath.h tidak menggunakan const pointer
+    ModSub256(dx, (uint64_t*)x2, (uint64_t*)x1);
+    ModSub256(dy, (uint64_t*)y2, (uint64_t*)y1);
     
     // Inverse dx
-    // Karena ini jarang dieksekusi (hanya saat wrap), kita pakai _ModInv standalone
     uint64_t inv_tmp[5];
     inv_tmp[0] = dx[0]; inv_tmp[1] = dx[1]; inv_tmp[2] = dx[2]; inv_tmp[3] = dx[3]; inv_tmp[4] = 0;
     _ModInv(inv_tmp);
@@ -81,14 +78,14 @@ __device__ void pointAddAffineGeneric(
     
     // x3 = lam^2 - x1 - x2
     _ModSqr(x3, lam);
-    ModSub256(x3, x3, x1);
-    ModSub256(x3, x3, x2);
+    ModSub256(x3, x3, (uint64_t*)x1);
+    ModSub256(x3, x3, (uint64_t*)x2);
     
     // y3 = lam(x1 - x3) - y1
     uint64_t t[4];
-    ModSub256(t, x1, x3);
+    ModSub256(t, (uint64_t*)x1, x3);
     _ModMult(y3, t, lam);
-    ModSub256(y3, y3, y1);
+    ModSub256(y3, y3, (uint64_t*)y1);
 }
 
 __launch_bounds__(256, 2)
@@ -171,7 +168,7 @@ __global__ void kernel_point_add_and_check_oneinv(
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
-        // ... (Bagian Hash Check tetap sama persis) ...
+        // --- HASH CHECK UTAMA ---
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
@@ -198,6 +195,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             }
         }
 
+        // --- BATCH INVERSION LOGIC ---
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
@@ -230,13 +228,14 @@ __global__ void kernel_point_add_and_check_oneinv(
         ModNeg256(sy_neg, y1);
         ModNeg256(sx_neg, x1);
 
+        // --- LOOP PENGECEKAN +G dan -G ---
         for (int i = 0; i < half - 1; ++i) {
             if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // --- BLOK +G ---
+            // BLOK +G
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
@@ -282,7 +281,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
             }
 
-            // --- BLOK -G ---
+            // BLOK -G
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
@@ -309,8 +308,8 @@ __global__ void kernel_point_add_and_check_oneinv(
                     if (match) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                             uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t sub=(uint64_t)(i+1);
-                            for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+                            uint64_t subv=(uint64_t)(i+1);
+                            for (int k=0;k<4 && subv;++k){ uint64_t old=fs[k]; fs[k]=old-subv; subv=(old<subv)?1ull:0ull; }
                             #pragma unroll
                             for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
                             #pragma unroll
@@ -366,8 +365,8 @@ __global__ void kernel_point_add_and_check_oneinv(
                 if (match) {
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                         uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t sub=(uint64_t)half;
-                        for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+                        uint64_t subv=(uint64_t)half;
+                        for (int k=0;k<4 && subv;++k){ uint64_t old=fs[k]; fs[k]=old-subv; subv=(old<subv)?1ull:0ull; }
                         #pragma unroll
                         for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
                         #pragma unroll
@@ -418,7 +417,6 @@ __global__ void kernel_point_add_and_check_oneinv(
         // 2. Hitung S_temp = S + B
         uint64_t s_temp[4];
         uint64_t carry = 0;
-        // Add B to S
         {
              __uint128_t res = (__uint128_t)S[0] + (uint64_t)B;
              s_temp[0] = (uint64_t)res;
@@ -432,40 +430,9 @@ __global__ void kernel_point_add_and_check_oneinv(
              s_temp[3] = S[3] + carry;
         }
 
-        // 3. Cek Wrap-Around (Apakah S_temp >= RangeEnd?)
-        // Karena range power of 2 dan start aligned, kita cek apakah bit high menyala
-        // atau lebih sederhana: bandingkan dengan c_RangeLen.
-        // Logika: Jika S_temp >= c_RangeStart + c_RangeLen
-        
+        // 3. Cek Wrap-Around
         bool wrap = false;
-        // Cek simple: jika carry out terjadi (S wrap ke 0), atau jika S_temp > RangeEnd.
-        // Karena start aligned, kita bisa cek: jika (s_temp & range_len) != 0 ??
-        // Tidak, range_len adalah length. RangeEnd = Start + Len.
-        // Kita cek apakah s_temp >= c_RangeStart + c_RangeLen.
-        // Atau gunakan logika borrow.
-        
-        // Cara paling aman: cek apakah s_temp >= c_RangeLen (jika start=0).
-        // Karena kita pakai absolute coordinates, kita hitung End dulu.
-        // Untuk efisiensi, kita asumsikan RangeLen power of 2.
-        // Jika S bergeser melewati power of 2 boundary, wrap.
-        
-        // Logika Wrap:
-        // Jika (s_temp - c_RangeStart) >= c_RangeLen
         uint64_t diff[4];
-        // Sub256(diff, s_temp, c_RangeStart) -> borrow check
-        // Sub manual:
-        // ...
-        // Lebih cepat: cek flag carry dari penjumlahan sebelumnya? Tidak, B kecil.
-        // Kita pakai logika: jika S_new melewati End.
-        // Karena RangeLen power of 2, bit ke-n akan menyala jika >= Len (relative).
-        // Kalkulasi relatif: Rel = S_temp - c_RangeStart.
-        
-        // Kita lakukan pengecekan 256-bit biasa (sederhana)
-        uint64_t end_local[4];
-        // End = Start + Len
-        // Kita tidak simpan End, kita simpan Start dan Len.
-        // Wrap jika S_temp - Start >= Len.
-        // Kita hitung diff = S_temp - Start
         uint64_t b_sub = 0;
         for(int k=0; k<4; ++k) {
             uint64_t val = s_temp[k];
@@ -475,12 +442,6 @@ __global__ void kernel_point_add_and_check_oneinv(
             b_sub = (val < sub_val + b_sub) ? 1 : 0;
         }
         
-        // Jika diff >= c_RangeLen -> Wrap
-        // Bandingkan diff vs c_RangeLen
-        // Karena range_len power of 2, kita bisa cek bit.
-        // Atau loop perbandingan.
-        // Asumsi: Kasus wrap jarang terjadi (hanya jika B mendekati ujung).
-        // Perbandingan simple:
         if (diff[3] > c_RangeLen[3] || 
            (diff[3] == c_RangeLen[3] && diff[2] > c_RangeLen[2]) ||
            (diff[3] == c_RangeLen[3] && diff[2] == c_RangeLen[2] && diff[1] > c_RangeLen[1]) ||
@@ -489,10 +450,7 @@ __global__ void kernel_point_add_and_check_oneinv(
         }
         
         if (wrap) {
-            // S_new = S_temp - RangeLen
-            // P_new = P_temp - P_RangeLen
             uint64_t s_final[4];
-            // Sub Manual (S_temp - c_RangeLen)
             b_sub = 0;
             for(int k=0; k<4; ++k) {
                 uint64_t val = s_temp[k];
@@ -501,25 +459,19 @@ __global__ void kernel_point_add_and_check_oneinv(
                 b_sub = (val < sub_val + b_sub) ? 1 : 0;
             }
             
-            // Point Subtraction: P_temp - c_P_RangeLen = P_temp + (-c_P_RangeLen)
-            // -P_RangeLen adalah (X, -Y)
             uint64_t neg_Y_range[4];
-            ModNeg256(neg_Y_range, c_P_RangeLen_Y);
+            ModNeg256(neg_Y_range, (uint64_t*)c_P_RangeLen_Y); // Cast const away
             
             pointAddAffineGeneric(x_temp, y_temp, c_P_RangeLen_X, neg_Y_range, x1, y1);
             
             #pragma unroll
             for(int k=0; k<4; ++k) S[k] = s_final[k];
         } else {
-            // Tidak wrap
             #pragma unroll
             for(int k=0; k<4; ++k) { x1[k] = x_temp[k]; y1[k] = y_temp[k]; S[k] = s_temp[k]; }
         }
 
-        // 4. Update Remaining (counts)
-        // Dalam mode Grasshopper, kita selalu mengurangi 'rem' untuk tracking seberapa banyak kita bekerja
         sub256_u64_inplace(rem, (uint64_t)B);
-        
         ++batches_done;
     }
 
@@ -557,7 +509,7 @@ int main(int argc, char** argv) {
     uint32_t runtime_batches_per_sm    = 8;
     uint32_t slices_per_launch         = 64;
 
-    // Parser args (sama seperti sebelumnya)
+    // Parser args
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
         if (comma == std::string::npos) return false;
@@ -648,7 +600,7 @@ int main(int argc, char** argv) {
     sub256(range_end, range_start, range_len); 
     add256_u64(range_len, 1ull, range_len);
 
-    // Validasi Range Power of 2 (Diperlukan untuk Grasshopper logic sederhana)
+    // Validasi Range Power of 2
     auto is_power_of_two_256 = [&](const uint64_t a[4])->bool {
         if ((a[0]|a[1]|a[2]|a[3]) == 0ull) return false;
         uint64_t am1[4]; uint64_t borrow = 1ull;
@@ -716,12 +668,8 @@ int main(int argc, char** argv) {
     }
     int blocks = (int)(threadsTotal / (uint64_t)threadsPerBlock);
 
-    // Per-thread count untuk Grasshopper:
-    // Karena pencarian acak, kita set counts = RangeLen agar thread berjalan lama
-    // Atau set sesuai kebutuhan (RangeLen / ThreadsTotal) jika ingin fair.
-    // Untuk Grasshopper, kita set sama dengan RangeLen agar thread bisa "melompat" jauh.
     uint64_t per_thread_cnt[4]; 
-    for(int k=0;k<4;++k) per_thread_cnt[k] = range_len[k]; // Full range scanning potential
+    for(int k=0;k<4;++k) per_thread_cnt[k] = range_len[k]; 
 
     // Alokasi Memori
     uint64_t* h_counts256     = nullptr;
@@ -748,7 +696,6 @@ int main(int argc, char** argv) {
     std::mt19937_64 gen(rd());
     std::uniform_int_distribution<uint64_t> dist(0, std::numeric_limits<uint64_t>::max());
 
-    // Hitung mask untuk modulo bit (karena range power of 2)
     uint64_t len_minus1[4];
     {   uint64_t borrow=1ull;
         for (int i=0;i<4;++i) {
@@ -758,14 +705,12 @@ int main(int argc, char** argv) {
     }
 
     for (uint64_t i = 0; i < threadsTotal; ++i) {
-        // Generate Random Offset
         uint64_t rand_offset[4];
         rand_offset[0] = dist(gen) & len_minus1[0];
         rand_offset[1] = dist(gen) & len_minus1[1];
         rand_offset[2] = dist(gen) & len_minus1[2];
         rand_offset[3] = dist(gen) & len_minus1[3];
         
-        // Start Scalar = RangeStart + RandomOffset
         add256(range_start, rand_offset, &h_start_scalars[i*4]);
     }
 
@@ -813,7 +758,7 @@ int main(int argc, char** argv) {
       ck(cudaMemcpy(d_found_flag, &zero,   sizeof(int),                cudaMemcpyHostToDevice), "init found_flag");
       ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes_accum"); }
 
-    // Precompute P_Start (Initial Points dari Random Scalars)
+    // Precompute P_Start
     {
         int blocks_scal = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
@@ -821,7 +766,7 @@ int main(int argc, char** argv) {
         ck(cudaGetLastError(), "scalarMulKernelBase launch");
     }
 
-    // Precompute G Table (1G ... half*G)
+    // Precompute G Table
     {
         uint64_t* h_scalars_half = nullptr;
         cudaHostAlloc(&h_scalars_half, (size_t)half * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
@@ -851,7 +796,7 @@ int main(int argc, char** argv) {
         std::free(h_Gx_half); std::free(h_Gy_half);
     }
     
-    // Precompute Jump Point J = B * G
+    // Precompute Jump Point J
     {
         uint64_t* h_scalarB = nullptr;
         cudaHostAlloc(&h_scalarB, 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
@@ -878,11 +823,10 @@ int main(int argc, char** argv) {
         cudaFreeHost(h_scalarB);
     }
 
-    // Precompute RangeLen * G (untuk Wrap-Around)
+    // Precompute RangeLen * G
     {
         uint64_t* h_scalarRL = nullptr;
         cudaHostAlloc(&h_scalarRL, 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-        // Copy range_len (sudah uint64[4])
         memcpy(h_scalarRL, range_len, 4 * sizeof(uint64_t));
 
         uint64_t *d_scalarRL=nullptr, *d_RLx=nullptr, *d_RLy=nullptr;
@@ -961,12 +905,9 @@ int main(int argc, char** argv) {
                 double mkeys = delta / (dt * 1e6);
                 double elapsed = std::chrono::duration<double>(now - t0).count();
                 
-                // Karena Random, progress bukan linear. Kita tampilkan "Keys Checked" saja.
-                // Bisa hitung "Expected Coverage" probabilitas jika diinginkan.
                 long double total_keys_ld = ld_from_u256(range_len);
                 long double coverage = 0.0L;
                 if (total_keys_ld > 0.0L) {
-                     // Simple approximation: (keys / total) * 100
                      coverage = ((long double)h_hashes / total_keys_ld) * 100.0L;
                 }
                 
@@ -993,17 +934,12 @@ int main(int argc, char** argv) {
         std::cout.flush();
         if (stop_all || g_sigint) break;
 
-        // Swap Buffers
         std::swap(d_Px, d_Rx);
         std::swap(d_Py, d_Ry);
 
-        // Di mode Grasshopper, kita tidak pernah selesai (wrap around), kecuali found.
-        // Kecuali jika ada mekanisme stop manual.
-        // Kita set h_any = 1 agar loop terus berjalan selama tidak ketemu.
-        // Kecuali jika user set specific count limit di counts256.
         unsigned int h_any = 0u;
         ck(cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost), "read any_left");
-        if (h_any == 0u) { completed_all = true; break; } // Jika counts habis (misal user set limit)
+        if (h_any == 0u) { completed_all = true; break; }
     }
 
     cudaDeviceSynchronize();
