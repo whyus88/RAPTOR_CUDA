@@ -36,8 +36,6 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
     return f == FOUND_READY;
 }
 
-// MAX_BATCH_SIZE 1024 (2^10) agar muat di Constant Memory (64KB limit)
-// 1024 sudah cukup besar untuk effisiensi batch inversion
 #ifndef MAX_BATCH_SIZE
 #define MAX_BATCH_SIZE 1024
 #endif
@@ -52,7 +50,7 @@ __constant__ uint64_t c_Jy[4];
 __constant__ int c_vanity_len;
 
 // ============================================================
-// KERNEL: SYSTEMATIC SWEEP (LINEAR SCAN)
+// KERNEL: SYSTEMATIC SWEEP (LINEAR SCAN) - FIXED
 // ============================================================
 __launch_bounds__(256, 2)
 __global__ void kernel_point_add_and_check_oneinv(
@@ -106,7 +104,6 @@ __global__ void kernel_point_add_and_check_oneinv(
     #pragma unroll
     for (int i = 0; i < 4; ++i) rem[i] = counts256[gid*4 + i];
 
-    // Jika count sudah nol, thread ini selesai
     if ((rem[0]|rem[1]|rem[2]|rem[3]) == 0ull) {
         #pragma unroll
         for (int i = 0; i < 4; ++i) { Rx[gid*4+i] = x1[i]; Ry[gid*4+i] = y1[i]; }
@@ -132,7 +129,6 @@ __global__ void kernel_point_add_and_check_oneinv(
         }
     };
 
-    // Loop pemrosesan batch
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
@@ -202,7 +198,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // BLOK +G (P + (i+1)G)
+            // BLOK +G
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
@@ -248,7 +244,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
             }
 
-            // BLOK -G (P - (i+1)G)
+            // BLOK -G
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
@@ -350,23 +346,31 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
+
+            // =======================================================
+            // PERBAIKAN BUG: Update Inverse untuk Jump Point J
+            // =======================================================
+            // Saat ini, inverse = 1 / ( (x_halfG - x_P) * (x_J - x_P) )
+            // Kita perlu mengalikannya dengan (x_halfG - x_P) agar menjadi 1 / (x_J - x_P)
+            uint64_t dx_halfG[4];
+            #pragma unroll
+            for (int j=0;j<4;++j) dx_halfG[j] = c_Gx[(size_t)i*4 + j]; // i adalah half-1 -> titik halfG
+            ModSub256(dx_halfG, dx_halfG, x1);
+            _ModMult(inverse, inverse, dx_halfG);
+            // Sekarang inverse = 1 / (x_J - x_P), siap untuk Linear Sweep Update
         }
 
         // ==========================================
-        // LINEAR SWEEP UPDATE (NO WRAP)
+        // LINEAR SWEEP UPDATE
         // ==========================================
-        // Saat ini, 'inverse' sudah sama dengan 1 / (x_J - x_P)
-        // Kita gunakan ini untuk menghitung P_new = P + J
-        
         uint64_t lam_up[4], s_up[4];
         uint64_t x_new[4], y_new[4];
         uint64_t old_x[4], old_y[4];
 
-        // Backup P lama
         #pragma unroll
         for(int j=0;j<4;++j) { old_x[j] = x1[j]; old_y[j] = y1[j]; }
 
-        // Hitung Lambda
+        // Hitung Lambda menggunakan inverse yang sudah dikoreksi
         uint64_t dy_up[4];
         #pragma unroll
         for(int j=0;j<4;++j) dy_up[j] = c_Jy[j];
@@ -429,6 +433,15 @@ __global__ void kernel_point_add_and_check_oneinv(
     #undef check_vanity
 }
 
+void mul256_u64(const uint64_t a[4], uint64_t b, uint64_t r[4]) {
+    uint64_t carry = 0;
+    for (int i = 0; i < 4; ++i) {
+        __uint128_t res = (__uint128_t)a[i] * b + carry;
+        r[i] = (uint64_t)res;
+        carry = (uint64_t)(res >> 64);
+    }
+}
+
 // ============================================================
 // HOST CODE
 // ============================================================
@@ -439,14 +452,7 @@ extern std::string formatHex256(const uint64_t limbs[4]);
 extern long double ld_from_u256(const uint64_t v[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
-void mul256_u64(const uint64_t a[4], uint64_t b, uint64_t r[4]) {
-    uint64_t carry = 0;
-    for (int i = 0; i < 4; ++i) {
-        __uint128_t res = (__uint128_t)a[i] * b + carry;
-        r[i] = (uint64_t)res;
-        carry = (uint64_t)(res >> 64);
-    }
-}
+
 
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
