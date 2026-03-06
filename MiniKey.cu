@@ -64,7 +64,7 @@ __constant__ const uint32_t c_sha256_k[64] = {
 };
 
 // ============================================================
-// DEVICE HELPERS: SHA256 & RANDOM
+// DEVICE HELPERS
 // ============================================================
 __device__ __forceinline__ uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
 __device__ __forceinline__ uint32_t sha2_ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~x & z); }
@@ -112,43 +112,13 @@ __device__ uint64_t xorshift128plus(uint64_t* s) {
 
 __device__ __forceinline__ int load_found_flag_relaxed(const int* p) { return *((const volatile int*)p); }
 
-// ============================================================
-// DEVICE: JACOBIAN ELLIPTIC CURVE MATH (OPTIMIZED)
-// ============================================================
-
-// Helper: Add Mod P (dengan reduksi sederhana)
-__device__ void add_mod(uint64_t* r, const uint64_t* a, const uint64_t* b) {
-    // Lakukan penjumlahan dengan assembly macro dari CUDAMath.h
-    // UADDO, UADDC, UADD ada di CUDAMath.h
+// Helper Add Mod P (Simple)
+__device__ void add_mod_p(uint64_t* r, const uint64_t* a, const uint64_t* b) {
     UADDO(r[0], a[0], b[0]);
     UADDC(r[1], a[1], b[1]);
     UADDC(r[2], a[2], b[2]);
     UADD(r[3], a[3], b[3]);
 
-    // Jika >= P, kurangkan P (P = 0xFFFF...FFFFFC2F)
-    // Logika sederhana: jika carry out terjadi atau r >= P, sub P.
-    // Karena P mendekati 2^256, kita bisa lakukan sub P dan jika underflow, kembalikan.
-    // Namun cara termudah adalah cek apakah lebih besar dari P.
-    // Untuk simplisitas di CUDA, kita gunakan fungsi SubP dari CUDAMath.h jika ada,
-    // atau logic manual. Macro SubP(r) melakukan r = r - P.
-    // Tapi kita butuh conditional.
-    
-    // Note: Cara paling aman dan cepat di CUDA tanpa branching berlebihan:
-    // r = (r >= P) ? r - P : r;
-    // Implementasi approximasi:
-    // Jika carry flag dari penjumlahan atas tidak set, kita cek manual.
-    // Untuk secp256k1, P sangat besar, sehingga overflow jarang terjadi kecuali a+b > 2^256.
-    // Kita gunakan SubP macro jika ada di CUDAMath.h (ada di kode sebelumnya).
-    // Namun SubP di CUDAMath.h sebelumnya adalah macro yang mengurangi P dari register.
-    // Kita asumsikan fieldAdd manual untuk sementara:
-    
-    // Cara cepat: Gunakan logic yang ada di CUDAUtils.h fieldAdd tapi porting ke device.
-    // Karena batas ruang, kita gunakan _ModMult yang sudah ada dan asumsikan operasi add aman untuk input kecil
-    // atau kita gunakan _IsNegative helper dari CUDAMath.h setelah sub P.
-    
-    // Simplified Safe Add:
-    // 1. r = a + b
-    // 2. if r >= P, r = r - P
     bool needs_sub = false;
     if (r[3] > 0xFFFFFFFEFFFFFFFFULL) needs_sub = true;
     else if (r[3] == 0xFFFFFFFEFFFFFFFFULL) {
@@ -161,7 +131,6 @@ __device__ void add_mod(uint64_t* r, const uint64_t* a, const uint64_t* b) {
          }
     }
     if (needs_sub) {
-        uint64_t borrow;
         USUBO(r[0], r[0], 0xFFFFFFFEFFFFFC2FULL);
         USUBC(r[1], r[1], 0xFFFFFFFFFFFFFFFFULL);
         USUBC(r[2], r[2], 0xFFFFFFFFFFFFFFFFULL);
@@ -169,61 +138,50 @@ __device__ void add_mod(uint64_t* r, const uint64_t* a, const uint64_t* b) {
     }
 }
 
-// Jacobian Point: (X, Y, Z). Affine: (X/Z^2, Y/Z^3)
-// G adalah generator dalam Affine.
-// Double Point: 2P
+// ============================================================
+// DEVICE: JACOBIAN ELLIPTIC CURVE MATH
+// ============================================================
+
 __device__ void pointDoubleJac(uint64_t X[4], uint64_t Y[4], uint64_t Z[4]) {
-    if ((Y[0] | Y[1] | Y[2] | Y[3]) == 0) return; // Point at infinity
+    if ((Y[0] | Y[1] | Y[2] | Y[3]) == 0) return;
 
     uint64_t A[4], B[4], C[4], D[4], E[4], F[4], X3[4], Y3[4], Z3[4];
 
-    // A = X^2
     _ModSqr(A, X);
-    // B = Y^2
     _ModSqr(B, Y);
-    // C = B^2
     _ModSqr(C, B);
-    // D = 2*((X+B)^2 - A - C) = 2*(X+Y^2)^2 - A - C -> simplified: 2*X*B + C ? No.
-    // Formula standar: S = 4*X*B
-    // D = 2*((X + B)^2 - A - C)
+
     uint64_t t1[4];
-    add_mod(t1, X, B); // t1 = X+B
-    _ModSqr(D, t1);    // D = (X+B)^2
-    Sub2(D, D, A);     // D = D - A
-    Sub2(D, D, C);     // D = D - C
-    add_mod(D, D, D);  // D = 2*D (S in formulas)
+    add_mod_p(t1, X, B); 
+    _ModSqr(D, t1);
+    Sub2(D, D, A);
+    Sub2(D, D, C);
+    add_mod_p(D, D, D);
 
-    // E = 3*A
-    add_mod(E, A, A);
-    add_mod(E, E, A);
+    add_mod_p(E, A, A);
+    add_mod_p(E, E, A);
 
-    // F = E^2
     _ModSqr(F, E);
 
-    // X3 = F - 2*D
     Sub2(X3, F, D);
     Sub2(X3, X3, D);
 
-    // Y3 = E*(D - X3) - 8*C
-    Sub2(Y3, D, X3);   // t1 = D - X3
-    _ModMult(Y3, E, Y3); // Y3 = E * (D - X3)
-    add_mod(t1, C, C);   // t1 = 2C
-    add_mod(t1, t1, t1); // t1 = 4C
-    add_mod(t1, t1, t1); // t1 = 8C
-    Sub2(Y3, Y3, t1);    // Y3 = E... - 8C
+    Sub2(Y3, D, X3);
+    _ModMult(Y3, E, Y3);
+    add_mod_p(t1, C, C);
+    add_mod_p(t1, t1, t1);
+    add_mod_p(t1, t1, t1);
+    Sub2(Y3, Y3, t1);
 
-    // Z3 = 2*Y*Z
     _ModMult(Z3, Y, Z);
-    add_mod(Z3, Z3, Z3);
+    add_mod_p(Z3, Z3, Z3);
 
-    // Update
     Load(X, X3); Load(Y, Y3); Load(Z, Z3);
 }
 
-// Add Mixed: P (Jacobian) + Q (Affine)
+// FIX: Menghapus 'const' dari X2 dan Y2 agar sesuai dengan signature _ModMult di CUDAMath.h
 __device__ void pointAddMixedJac(uint64_t X1[4], uint64_t Y1[4], uint64_t Z1[4], 
-                                 const uint64_t X2[4], const uint64_t Y2[4]) {
-    // Jika P adalah infinity, hasil adalah Q
+                                 uint64_t X2[4], uint64_t Y2[4]) {
     if ((Z1[0] | Z1[1] | Z1[2] | Z1[3]) == 0) {
         Load(X1, X2); Load(Y1, Y2);
         Z1[0]=1; Z1[1]=0; Z1[2]=0; Z1[3]=0;
@@ -232,48 +190,34 @@ __device__ void pointAddMixedJac(uint64_t X1[4], uint64_t Y1[4], uint64_t Z1[4],
     
     uint64_t Z1Z1[4], U2[4], S2[4], H[4], I[4], J[4], r[4], V[4], X3[4], Y3[4], Z3[4];
     
-    // Z1Z1 = Z1^2
     _ModSqr(Z1Z1, Z1);
-    
-    // U2 = X2 * Z1Z1
-    _ModMult(U2, X2, Z1Z1);
-    
-    // S2 = Y2 * Z1 * Z1Z1
-    _ModMult(S2, Y2, Z1);
+    _ModMult(U2, X2, Z1Z1); // Fixed: X2 is now non-const
+    _ModMult(S2, Y2, Z1);   // Fixed: Y2 is now non-const
     _ModMult(S2, S2, Z1Z1);
     
-    // H = U2 - X1
     Sub2(H, U2, X1);
-    
-    // I = (2*H)^2
-    add_mod(I, H, H);
+    add_mod_p(I, H, H);
     _ModSqr(I, I);
     
-    // J = H * I
     _ModMult(J, H, I);
     
-    // r = 2*(S2 - Y1)
     Sub2(r, S2, Y1);
-    add_mod(r, r, r);
+    add_mod_p(r, r, r);
     
-    // V = X1 * I
     _ModMult(V, X1, I);
     
-    // X3 = r^2 - J - 2*V
     _ModSqr(X3, r);
     Sub2(X3, X3, J);
     Sub2(X3, X3, V);
     Sub2(X3, X3, V);
     
-    // Y3 = r*(V - X3) - Y1*J
     Sub2(Y3, V, X3);
     _ModMult(Y3, r, Y3);
     uint64_t t[4];
     _ModMult(t, Y1, J);
     Sub2(Y3, Y3, t);
     
-    // Z3 = (Z1 + H)^2 - Z1Z1 - I
-    add_mod(Z3, Z1, H);
+    add_mod_p(Z3, Z1, H);
     _ModSqr(Z3, Z3);
     Sub2(Z3, Z3, Z1Z1);
     Sub2(Z3, Z3, I);
@@ -281,22 +225,14 @@ __device__ void pointAddMixedJac(uint64_t X1[4], uint64_t Y1[4], uint64_t Z1[4],
     Load(X1, X3); Load(Y1, Y3); Load(Z1, Z3);
 }
 
-// Multiply Scalar k * G (menggunakan Jacobian)
 __device__ void scalarMulJac(const uint64_t k[4], uint64_t Rx_out[4], uint64_t Ry_out[4]) {
-    // Generator G
-    const uint64_t Gx[4] = { 0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL, 0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL };
-    const uint64_t Gy[4] = { 0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL, 0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL };
+    // FIX: Menghapus 'const' agar bisa passed ke pointAddMixedJac
+    uint64_t Gx[4] = { 0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL, 0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL };
+    uint64_t Gy[4] = { 0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL, 0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL };
 
-    uint64_t Rx[4] = {0}, Ry[4] = {0}, Rz[4] = {0}; // Infinity (Z=0)
-    
-    // Double-and-Add loop
-    // Scan dari bit tertinggi
-    // Untuk simplisitas, scan dari MSB (256 down to 0)
-    // Cara ini lambat dibanding windowed method, tapi masih jauh lebih cepat dari Affine karena pakai Jacobian.
+    uint64_t Rx[4] = {0}, Ry[4] = {0}, Rz[4] = {0};
     
     bool started = false;
-    
-    // Cari MSB
     int msb = 255;
     while(msb >= 0) {
         int limb = msb >> 6;
@@ -304,7 +240,7 @@ __device__ void scalarMulJac(const uint64_t k[4], uint64_t Rx_out[4], uint64_t R
         if (k[limb] & (1ULL << bit)) break;
         msb--;
     }
-    if (msb < 0) { // k = 0
+    if (msb < 0) { 
         Rx_out[0]=0; Rx_out[1]=0; Rx_out[2]=0; Rx_out[3]=0;
         Ry_out[0]=0; Ry_out[1]=0; Ry_out[2]=0; Ry_out[3]=0;
         return;
@@ -320,9 +256,8 @@ __device__ void scalarMulJac(const uint64_t k[4], uint64_t Rx_out[4], uint64_t R
         
         if (k[limb] & (1ULL << bit)) {
             if (!started) {
-                // First 1: Init with G
                 Load(Rx, Gx); Load(Ry, Gy);
-                Rz[0] = 1; Rz[1]=0; Rz[2]=0; Rz[3]=0; // Z=1
+                Rz[0] = 1; Rz[1]=0; Rz[2]=0; Rz[3]=0;
                 started = true;
             } else {
                 pointAddMixedJac(Rx, Ry, Rz, Gx, Gy);
@@ -330,27 +265,17 @@ __device__ void scalarMulJac(const uint64_t k[4], uint64_t Rx_out[4], uint64_t R
         }
     }
     
-    // Konversi Jacobian ke Affine
-    // X_aff = X * Z^-2
-    // Y_aff = Y * Z^-3
     if ((Rz[0] | Rz[1] | Rz[2] | Rz[3]) == 0) {
-        // Infinity
         Rx_out[0]=0; Ry_out[0]=0;
     } else {
         uint64_t zinv[5], z2[4], z3[4];
-        
-        // Hitung Z^-1
         Load(zinv, Rz); zinv[4]=0;
-        _ModInv(zinv); // Dari CUDAMath.h (perlu 320-bit buffer)
+        _ModInv(zinv); 
         
-        // Z^-2
         _ModSqr(z2, zinv);
-        // Z^-3 = Z^-2 * Z^-1
         _ModMult(z3, z2, zinv);
         
-        // X_aff = X * Z^-2
         _ModMult(Rx_out, Rx, z2);
-        // Y_aff = Y * Z^-3
         _ModMult(Ry_out, Ry, z3);
     }
 }
@@ -379,7 +304,6 @@ __global__ void kernel_minikey_search(
     while (true) {
         if (load_found_flag_relaxed(d_found_flag) == FOUND_READY) break;
         
-        // 1. Gen
         mk_buffer[0] = 'S';
         for (int i = 1; i < target_len; ++i) {
             uint64_t r = xorshift128plus(rng_state);
@@ -387,7 +311,6 @@ __global__ void kernel_minikey_search(
         }
         mk_buffer[target_len] = '\0';
 
-        // 2. Checksum (SHA256)
         uint8_t hash_check[32];
         mk_buffer[target_len] = '?';
         sha256_device((uint8_t*)mk_buffer, target_len + 1, hash_check);
@@ -400,12 +323,10 @@ __global__ void kernel_minikey_search(
             continue;
         }
 
-        // 3. Valid Minikey -> Priv Key
         mk_buffer[target_len] = '\0';
         uint8_t priv_key_bytes[32];
         sha256_device((uint8_t*)mk_buffer, target_len, priv_key_bytes);
 
-        // Convert LE
         uint64_t scalar_le[4];
         scalar_le[0] = ((uint64_t)priv_key_bytes[31] << 0) | ((uint64_t)priv_key_bytes[30] << 8) |
                        ((uint64_t)priv_key_bytes[29] << 16) | ((uint64_t)priv_key_bytes[28] << 24) |
@@ -424,11 +345,9 @@ __global__ void kernel_minikey_search(
                        ((uint64_t)priv_key_bytes[3] << 32) | ((uint64_t)priv_key_bytes[2] << 40) |
                        ((uint64_t)priv_key_bytes[1] << 48) | ((uint64_t)priv_key_bytes[0] << 56);
 
-        // 4. EC Mult (JACOBIAN OPTIMIZED)
         uint64_t Rx[4], Ry[4];
         scalarMulJac(scalar_le, Rx, Ry);
 
-        // 5. Hash & Match
         uint8_t h20[20];
         uint8_t prefix = (uint8_t)(Ry[0] & 1ULL) ? 0x03 : 0x02;
         getHash160_33_from_limbs(prefix, Rx, h20);
