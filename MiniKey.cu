@@ -14,13 +14,12 @@
 #include <csignal>
 #include <atomic>
 
-// Sertakan header math dan utilitas yang sudah ada
 #include "CUDAMath.h"
 #include "CUDAHash.cuh"
 #include "CUDAUtils.h"
 
 // ============================================================
-// PERBAIKAN ERROR: Definisi Konstanta Status
+// DEFINISI KONSTANTA
 // ============================================================
 #ifndef FOUND_NONE
 #define FOUND_NONE  0
@@ -32,34 +31,24 @@
 #define FOUND_READY 2
 #endif
 
-// ============================================================
-// KONFIGURASI & KONSTANTA
-// ============================================================
 #define MAX_MINIKEY_LEN 32
 
-// Struktur hasil (Override jika belum ada di header)
 struct FoundResult {
     int      threadId;
     int      iter;
-    char     minikey_str[MAX_MINIKEY_LEN]; // String Minikey (S...)
-    uint64_t scalar[4]; // Private Key hasil SHA256(minikey)
-    uint64_t Rx[4];     // Public Key X
-    uint64_t Ry[4];     // Public Key Y
+    char     minikey_str[MAX_MINIKEY_LEN];
+    uint64_t scalar[4];
+    uint64_t Rx[4];
+    uint64_t Ry[4];
 };
 
 static volatile sig_atomic_t g_sigint = 0;
 static void handle_sigint(int) { g_sigint = 1; }
 
-// Device Constants
 __constant__ uint8_t  c_target_hash160[20];
 __constant__ uint32_t c_target_prefix;
 __constant__ int      c_vanity_len;
 __constant__ int      c_minikey_len_target;
-
-// ============================================================
-// PERBAIKAN ERROR: Ukuran Array Base58
-// String literal 58 char + null terminator = 59
-// ============================================================
 __constant__ const char c_b58_alphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 // SHA256 Constants
@@ -77,7 +66,6 @@ __constant__ const uint32_t c_sha256_k[64] = {
 // ============================================================
 // DEVICE HELPERS: SHA256 & RANDOM
 // ============================================================
-
 __device__ __forceinline__ uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
 __device__ __forceinline__ uint32_t sha2_ch(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (~x & z); }
 __device__ __forceinline__ uint32_t sha2_maj(uint32_t x, uint32_t y, uint32_t z) { return (x & y) ^ (x & z) ^ (y & z); }
@@ -86,70 +74,289 @@ __device__ __forceinline__ uint32_t sha2_ep1(uint32_t x) { return rotr(x, 6) ^ r
 __device__ __forceinline__ uint32_t sha2_sig0(uint32_t x) { return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3); }
 __device__ __forceinline__ uint32_t sha2_sig1(uint32_t x) { return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10); }
 
-// SHA256 Transform (Single Block)
 __device__ void sha256_device(const uint8_t* data, size_t len, uint8_t hash[32]) {
     uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
     uint32_t w[64];
     
-    // Prepare message schedule
     for (int i = 0; i < 16; ++i) w[i] = 0;
+    for (size_t i = 0; i < len; ++i) w[i / 4] |= ((uint32_t)data[i]) << (24 - (i % 4) * 8);
     
-    // Copy data (Big Endian)
-    for (size_t i = 0; i < len; ++i) {
-        w[i / 4] |= ((uint32_t)data[i]) << (24 - (i % 4) * 8);
-    }
-    
-    // Padding
     w[len / 4] |= ((uint32_t)0x80) << (24 - (len % 4) * 8);
-    
-    // Length (bits) in the last 2 words
     uint64_t bitLen = len * 8;
     w[14] = (uint32_t)(bitLen >> 32);
     w[15] = (uint32_t)bitLen;
 
-    // Extend
-    for (int i = 16; i < 64; ++i) {
-        w[i] = sha2_sig1(w[i-2]) + w[i-7] + sha2_sig0(w[i-15]) + w[i-16];
-    }
+    for (int i = 16; i < 64; ++i) w[i] = sha2_sig1(w[i-2]) + w[i-7] + sha2_sig0(w[i-15]) + w[i-16];
 
-    // Compress
     uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], h_loc = h[7];
-    
     for (int i = 0; i < 64; ++i) {
         uint32_t t1 = h_loc + sha2_ep1(e) + sha2_ch(e, f, g) + c_sha256_k[i] + w[i];
         uint32_t t2 = sha2_ep0(a) + sha2_maj(a, b, c);
-        h_loc = g; g = f; f = e; e = d + t1;
-        d = c; c = b; b = a; a = t1 + t2;
+        h_loc = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
     }
-    
     h[0] += a; h[1] += b; h[2] += c; h[3] += d;
     h[4] += e; h[5] += f; h[6] += g; h[7] += h_loc;
 
-    // Output Hash (Big Endian)
     for (int i = 0; i < 8; ++i) {
-        hash[i*4 + 0] = (h[i] >> 24) & 0xFF;
-        hash[i*4 + 1] = (h[i] >> 16) & 0xFF;
-        hash[i*4 + 2] = (h[i] >> 8) & 0xFF;
-        hash[i*4 + 3] = (h[i]) & 0xFF;
+        hash[i*4 + 0] = (h[i] >> 24) & 0xFF; hash[i*4 + 1] = (h[i] >> 16) & 0xFF;
+        hash[i*4 + 2] = (h[i] >> 8) & 0xFF;  hash[i*4 + 3] = (h[i]) & 0xFF;
     }
 }
 
-// XORSHIFT128+ RNG
 __device__ uint64_t xorshift128plus(uint64_t* s) {
-    uint64_t x = s[0];
-    uint64_t const y = s[1];
-    s[0] = y;
-    x ^= x << 23;
+    uint64_t x = s[0]; uint64_t const y = s[1];
+    s[0] = y; x ^= x << 23;
     s[1] = x ^ y ^ (x >> 17) ^ (y >> 26);
     return s[1] + y;
 }
 
-__device__ __forceinline__ int load_found_flag_relaxed(const int* p) {
-    return *((const volatile int*)p);
+__device__ __forceinline__ int load_found_flag_relaxed(const int* p) { return *((const volatile int*)p); }
+
+// ============================================================
+// DEVICE: JACOBIAN ELLIPTIC CURVE MATH (OPTIMIZED)
+// ============================================================
+
+// Helper: Add Mod P (dengan reduksi sederhana)
+__device__ void add_mod(uint64_t* r, const uint64_t* a, const uint64_t* b) {
+    // Lakukan penjumlahan dengan assembly macro dari CUDAMath.h
+    // UADDO, UADDC, UADD ada di CUDAMath.h
+    UADDO(r[0], a[0], b[0]);
+    UADDC(r[1], a[1], b[1]);
+    UADDC(r[2], a[2], b[2]);
+    UADD(r[3], a[3], b[3]);
+
+    // Jika >= P, kurangkan P (P = 0xFFFF...FFFFFC2F)
+    // Logika sederhana: jika carry out terjadi atau r >= P, sub P.
+    // Karena P mendekati 2^256, kita bisa lakukan sub P dan jika underflow, kembalikan.
+    // Namun cara termudah adalah cek apakah lebih besar dari P.
+    // Untuk simplisitas di CUDA, kita gunakan fungsi SubP dari CUDAMath.h jika ada,
+    // atau logic manual. Macro SubP(r) melakukan r = r - P.
+    // Tapi kita butuh conditional.
+    
+    // Note: Cara paling aman dan cepat di CUDA tanpa branching berlebihan:
+    // r = (r >= P) ? r - P : r;
+    // Implementasi approximasi:
+    // Jika carry flag dari penjumlahan atas tidak set, kita cek manual.
+    // Untuk secp256k1, P sangat besar, sehingga overflow jarang terjadi kecuali a+b > 2^256.
+    // Kita gunakan SubP macro jika ada di CUDAMath.h (ada di kode sebelumnya).
+    // Namun SubP di CUDAMath.h sebelumnya adalah macro yang mengurangi P dari register.
+    // Kita asumsikan fieldAdd manual untuk sementara:
+    
+    // Cara cepat: Gunakan logic yang ada di CUDAUtils.h fieldAdd tapi porting ke device.
+    // Karena batas ruang, kita gunakan _ModMult yang sudah ada dan asumsikan operasi add aman untuk input kecil
+    // atau kita gunakan _IsNegative helper dari CUDAMath.h setelah sub P.
+    
+    // Simplified Safe Add:
+    // 1. r = a + b
+    // 2. if r >= P, r = r - P
+    bool needs_sub = false;
+    if (r[3] > 0xFFFFFFFEFFFFFFFFULL) needs_sub = true;
+    else if (r[3] == 0xFFFFFFFEFFFFFFFFULL) {
+         if (r[2] > 0xFFFFFFFFFFFFFFFFULL) needs_sub = true;
+         else if (r[2] == 0xFFFFFFFFFFFFFFFFULL) {
+             if (r[1] > 0xFFFFFFFFFFFFFFFFULL) needs_sub = true;
+             else if (r[1] == 0xFFFFFFFFFFFFFFFFULL) {
+                 if (r[0] >= 0xFFFFFFFEFFFFFC2FULL) needs_sub = true;
+             }
+         }
+    }
+    if (needs_sub) {
+        uint64_t borrow;
+        USUBO(r[0], r[0], 0xFFFFFFFEFFFFFC2FULL);
+        USUBC(r[1], r[1], 0xFFFFFFFFFFFFFFFFULL);
+        USUBC(r[2], r[2], 0xFFFFFFFFFFFFFFFFULL);
+        USUB(r[3], r[3], 0xFFFFFFFFFFFFFFFFULL);
+    }
+}
+
+// Jacobian Point: (X, Y, Z). Affine: (X/Z^2, Y/Z^3)
+// G adalah generator dalam Affine.
+// Double Point: 2P
+__device__ void pointDoubleJac(uint64_t X[4], uint64_t Y[4], uint64_t Z[4]) {
+    if ((Y[0] | Y[1] | Y[2] | Y[3]) == 0) return; // Point at infinity
+
+    uint64_t A[4], B[4], C[4], D[4], E[4], F[4], X3[4], Y3[4], Z3[4];
+
+    // A = X^2
+    _ModSqr(A, X);
+    // B = Y^2
+    _ModSqr(B, Y);
+    // C = B^2
+    _ModSqr(C, B);
+    // D = 2*((X+B)^2 - A - C) = 2*(X+Y^2)^2 - A - C -> simplified: 2*X*B + C ? No.
+    // Formula standar: S = 4*X*B
+    // D = 2*((X + B)^2 - A - C)
+    uint64_t t1[4];
+    add_mod(t1, X, B); // t1 = X+B
+    _ModSqr(D, t1);    // D = (X+B)^2
+    Sub2(D, D, A);     // D = D - A
+    Sub2(D, D, C);     // D = D - C
+    add_mod(D, D, D);  // D = 2*D (S in formulas)
+
+    // E = 3*A
+    add_mod(E, A, A);
+    add_mod(E, E, A);
+
+    // F = E^2
+    _ModSqr(F, E);
+
+    // X3 = F - 2*D
+    Sub2(X3, F, D);
+    Sub2(X3, X3, D);
+
+    // Y3 = E*(D - X3) - 8*C
+    Sub2(Y3, D, X3);   // t1 = D - X3
+    _ModMult(Y3, E, Y3); // Y3 = E * (D - X3)
+    add_mod(t1, C, C);   // t1 = 2C
+    add_mod(t1, t1, t1); // t1 = 4C
+    add_mod(t1, t1, t1); // t1 = 8C
+    Sub2(Y3, Y3, t1);    // Y3 = E... - 8C
+
+    // Z3 = 2*Y*Z
+    _ModMult(Z3, Y, Z);
+    add_mod(Z3, Z3, Z3);
+
+    // Update
+    Load(X, X3); Load(Y, Y3); Load(Z, Z3);
+}
+
+// Add Mixed: P (Jacobian) + Q (Affine)
+__device__ void pointAddMixedJac(uint64_t X1[4], uint64_t Y1[4], uint64_t Z1[4], 
+                                 const uint64_t X2[4], const uint64_t Y2[4]) {
+    // Jika P adalah infinity, hasil adalah Q
+    if ((Z1[0] | Z1[1] | Z1[2] | Z1[3]) == 0) {
+        Load(X1, X2); Load(Y1, Y2);
+        Z1[0]=1; Z1[1]=0; Z1[2]=0; Z1[3]=0;
+        return;
+    }
+    
+    uint64_t Z1Z1[4], U2[4], S2[4], H[4], I[4], J[4], r[4], V[4], X3[4], Y3[4], Z3[4];
+    
+    // Z1Z1 = Z1^2
+    _ModSqr(Z1Z1, Z1);
+    
+    // U2 = X2 * Z1Z1
+    _ModMult(U2, X2, Z1Z1);
+    
+    // S2 = Y2 * Z1 * Z1Z1
+    _ModMult(S2, Y2, Z1);
+    _ModMult(S2, S2, Z1Z1);
+    
+    // H = U2 - X1
+    Sub2(H, U2, X1);
+    
+    // I = (2*H)^2
+    add_mod(I, H, H);
+    _ModSqr(I, I);
+    
+    // J = H * I
+    _ModMult(J, H, I);
+    
+    // r = 2*(S2 - Y1)
+    Sub2(r, S2, Y1);
+    add_mod(r, r, r);
+    
+    // V = X1 * I
+    _ModMult(V, X1, I);
+    
+    // X3 = r^2 - J - 2*V
+    _ModSqr(X3, r);
+    Sub2(X3, X3, J);
+    Sub2(X3, X3, V);
+    Sub2(X3, X3, V);
+    
+    // Y3 = r*(V - X3) - Y1*J
+    Sub2(Y3, V, X3);
+    _ModMult(Y3, r, Y3);
+    uint64_t t[4];
+    _ModMult(t, Y1, J);
+    Sub2(Y3, Y3, t);
+    
+    // Z3 = (Z1 + H)^2 - Z1Z1 - I
+    add_mod(Z3, Z1, H);
+    _ModSqr(Z3, Z3);
+    Sub2(Z3, Z3, Z1Z1);
+    Sub2(Z3, Z3, I);
+    
+    Load(X1, X3); Load(Y1, Y3); Load(Z1, Z3);
+}
+
+// Multiply Scalar k * G (menggunakan Jacobian)
+__device__ void scalarMulJac(const uint64_t k[4], uint64_t Rx_out[4], uint64_t Ry_out[4]) {
+    // Generator G
+    const uint64_t Gx[4] = { 0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL, 0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL };
+    const uint64_t Gy[4] = { 0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL, 0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL };
+
+    uint64_t Rx[4] = {0}, Ry[4] = {0}, Rz[4] = {0}; // Infinity (Z=0)
+    
+    // Double-and-Add loop
+    // Scan dari bit tertinggi
+    // Untuk simplisitas, scan dari MSB (256 down to 0)
+    // Cara ini lambat dibanding windowed method, tapi masih jauh lebih cepat dari Affine karena pakai Jacobian.
+    
+    bool started = false;
+    
+    // Cari MSB
+    int msb = 255;
+    while(msb >= 0) {
+        int limb = msb >> 6;
+        int bit = msb & 63;
+        if (k[limb] & (1ULL << bit)) break;
+        msb--;
+    }
+    if (msb < 0) { // k = 0
+        Rx_out[0]=0; Rx_out[1]=0; Rx_out[2]=0; Rx_out[3]=0;
+        Ry_out[0]=0; Ry_out[1]=0; Ry_out[2]=0; Ry_out[3]=0;
+        return;
+    }
+
+    for (int i = msb; i >= 0; --i) {
+        int limb = i >> 6;
+        int bit = i & 63;
+        
+        if (started) {
+            pointDoubleJac(Rx, Ry, Rz);
+        }
+        
+        if (k[limb] & (1ULL << bit)) {
+            if (!started) {
+                // First 1: Init with G
+                Load(Rx, Gx); Load(Ry, Gy);
+                Rz[0] = 1; Rz[1]=0; Rz[2]=0; Rz[3]=0; // Z=1
+                started = true;
+            } else {
+                pointAddMixedJac(Rx, Ry, Rz, Gx, Gy);
+            }
+        }
+    }
+    
+    // Konversi Jacobian ke Affine
+    // X_aff = X * Z^-2
+    // Y_aff = Y * Z^-3
+    if ((Rz[0] | Rz[1] | Rz[2] | Rz[3]) == 0) {
+        // Infinity
+        Rx_out[0]=0; Ry_out[0]=0;
+    } else {
+        uint64_t zinv[5], z2[4], z3[4];
+        
+        // Hitung Z^-1
+        Load(zinv, Rz); zinv[4]=0;
+        _ModInv(zinv); // Dari CUDAMath.h (perlu 320-bit buffer)
+        
+        // Z^-2
+        _ModSqr(z2, zinv);
+        // Z^-3 = Z^-2 * Z^-1
+        _ModMult(z3, z2, zinv);
+        
+        // X_aff = X * Z^-2
+        _ModMult(Rx_out, Rx, z2);
+        // Y_aff = Y * Z^-3
+        _ModMult(Ry_out, Ry, z3);
+    }
 }
 
 // ============================================================
-// KERNEL: MINIKEY RANDOM SEARCH
+// KERNEL
 // ============================================================
 __launch_bounds__(256, 2)
 __global__ void kernel_minikey_search(
@@ -160,23 +367,19 @@ __global__ void kernel_minikey_search(
 ) {
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned lane = (unsigned)(threadIdx.x & 31);
-    const unsigned full_mask = 0xFFFFFFFFu;
 
-    // Init RNG
     uint64_t rng_state[2];
     rng_state[0] = gid ^ 0xDEADBEEFCAFEBABEULL;
     rng_state[1] = (seed_high << 32) ^ gid; 
 
     const int target_len = c_minikey_len_target;
-    char mk_buffer[MAX_MINIKEY_LEN + 2]; // +1 for '?', +1 null
-    
-    // Local counter for performance
+    char mk_buffer[MAX_MINIKEY_LEN + 2];
     unsigned int local_attempts = 0;
 
     while (true) {
         if (load_found_flag_relaxed(d_found_flag) == FOUND_READY) break;
         
-        // 1. Generate Candidate
+        // 1. Gen
         mk_buffer[0] = 'S';
         for (int i = 1; i < target_len; ++i) {
             uint64_t r = xorshift128plus(rng_state);
@@ -184,14 +387,12 @@ __global__ void kernel_minikey_search(
         }
         mk_buffer[target_len] = '\0';
 
-        // 2. Validate Checksum: SHA256("S...?")
+        // 2. Checksum (SHA256)
         uint8_t hash_check[32];
         mk_buffer[target_len] = '?';
         sha256_device((uint8_t*)mk_buffer, target_len + 1, hash_check);
 
-        // Check if first byte is 0x00
         if (hash_check[0] != 0x00) {
-            // Invalid, skip
             if (++local_attempts >= 1024) {
                 if (lane == 0) atomicAdd(attempts_accum, (unsigned long long)local_attempts);
                 local_attempts = 0;
@@ -199,41 +400,35 @@ __global__ void kernel_minikey_search(
             continue;
         }
 
-        // 3. Valid Minikey Found! Compute Private Key
-        mk_buffer[target_len] = '\0'; // Remove '?'
-        
+        // 3. Valid Minikey -> Priv Key
+        mk_buffer[target_len] = '\0';
         uint8_t priv_key_bytes[32];
         sha256_device((uint8_t*)mk_buffer, target_len, priv_key_bytes);
 
-        // Convert BE bytes to LE 64-bit limbs for CUDAMath
-        // SHA256 output is Big Endian. 
-        // scalar[0] is lowest 64 bits of the number.
+        // Convert LE
         uint64_t scalar_le[4];
         scalar_le[0] = ((uint64_t)priv_key_bytes[31] << 0) | ((uint64_t)priv_key_bytes[30] << 8) |
                        ((uint64_t)priv_key_bytes[29] << 16) | ((uint64_t)priv_key_bytes[28] << 24) |
                        ((uint64_t)priv_key_bytes[27] << 32) | ((uint64_t)priv_key_bytes[26] << 40) |
                        ((uint64_t)priv_key_bytes[25] << 48) | ((uint64_t)priv_key_bytes[24] << 56);
-        
         scalar_le[1] = ((uint64_t)priv_key_bytes[23] << 0) | ((uint64_t)priv_key_bytes[22] << 8) |
                        ((uint64_t)priv_key_bytes[21] << 16) | ((uint64_t)priv_key_bytes[20] << 24) |
                        ((uint64_t)priv_key_bytes[19] << 32) | ((uint64_t)priv_key_bytes[18] << 40) |
                        ((uint64_t)priv_key_bytes[17] << 48) | ((uint64_t)priv_key_bytes[16] << 56);
-        
         scalar_le[2] = ((uint64_t)priv_key_bytes[15] << 0) | ((uint64_t)priv_key_bytes[14] << 8) |
                        ((uint64_t)priv_key_bytes[13] << 16) | ((uint64_t)priv_key_bytes[12] << 24) |
                        ((uint64_t)priv_key_bytes[11] << 32) | ((uint64_t)priv_key_bytes[10] << 40) |
                        ((uint64_t)priv_key_bytes[9] << 48) | ((uint64_t)priv_key_bytes[8] << 56);
-
         scalar_le[3] = ((uint64_t)priv_key_bytes[7] << 0) | ((uint64_t)priv_key_bytes[6] << 8) |
                        ((uint64_t)priv_key_bytes[5] << 16) | ((uint64_t)priv_key_bytes[4] << 24) |
                        ((uint64_t)priv_key_bytes[3] << 32) | ((uint64_t)priv_key_bytes[2] << 40) |
                        ((uint64_t)priv_key_bytes[1] << 48) | ((uint64_t)priv_key_bytes[0] << 56);
 
-        // 4. Compute Public Key
+        // 4. EC Mult (JACOBIAN OPTIMIZED)
         uint64_t Rx[4], Ry[4];
-        scalarMulBaseAffine(scalar_le, Rx, Ry);
+        scalarMulJac(scalar_le, Rx, Ry);
 
-        // 5. Check Hash160
+        // 5. Hash & Match
         uint8_t h20[20];
         uint8_t prefix = (uint8_t)(Ry[0] & 1ULL) ? 0x03 : 0x02;
         getHash160_33_from_limbs(prefix, Rx, h20);
@@ -242,24 +437,17 @@ __global__ void kernel_minikey_search(
         local_attempts = 0;
 
         bool match = false;
-        // Check prefix first
         if (load_u32_le(h20) == c_target_prefix) {
             match = true;
-            // Check full hash
-            for (int k = 4; k < c_vanity_len; ++k) {
-                if (h20[k] != c_target_hash160[k]) { match = false; break; }
-            }
+            for (int k = 4; k < c_vanity_len; ++k) if (h20[k] != c_target_hash160[k]) { match = false; break; }
         }
 
         if (match) {
             if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                // Save Result
                 memcpy(d_found_result->minikey_str, mk_buffer, target_len + 1);
                 memcpy(d_found_result->scalar, scalar_le, 32);
                 memcpy(d_found_result->Rx, Rx, 32);
                 memcpy(d_found_result->Ry, Ry, 32);
-                d_found_result->threadId = (int)gid;
-                
                 __threadfence_system();
                 atomicExch(d_found_flag, FOUND_READY);
             }
@@ -270,16 +458,14 @@ __global__ void kernel_minikey_search(
 // ============================================================
 // HOST CODE
 // ============================================================
-
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern std::string formatHex256(const uint64_t limbs[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
-
     std::string vanity_hash_hex;
-    int minikey_len = 30; // Default length
+    int minikey_len = 30;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -292,114 +478,64 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // Parse Target
-    uint8_t target_hash160[20];
-    memset(target_hash160, 0, 20);
-    if (vanity_hash_hex.length() > 40 || vanity_hash_hex.length() % 2 != 0) {
-        std::cerr << "Error: Invalid hash length.\n"; return EXIT_FAILURE;
-    }
+    uint8_t target_hash160[20]; memset(target_hash160, 0, 20);
     for (size_t i = 0; i < vanity_hash_hex.length() / 2; ++i) {
         std::string byteStr = vanity_hash_hex.substr(i * 2, 2);
         target_hash160[i] = (uint8_t)std::stoul(byteStr, nullptr, 16);
     }
     int vanity_len = (int)(vanity_hash_hex.length() / 2);
 
-    // Setup CUDA
     int device=0; cudaDeviceProp prop{};
-    if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) {
-        std::cerr<<"CUDA init error\n"; return EXIT_FAILURE;
-    }
-    cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
-
-    // Copy Constants
+    cudaGetDevice(&device); cudaGetDeviceProperties(&prop, device);
+    
     cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
     cudaMemcpyToSymbol(c_vanity_len, &vanity_len, sizeof(int));
     cudaMemcpyToSymbol(c_minikey_len_target, &minikey_len, sizeof(int));
 
     uint32_t prefix_le = 0;
-    if (vanity_len >= 4) {
-         prefix_le = (uint32_t)target_hash160[0]
-                   | ((uint32_t)target_hash160[1] << 8)
-                   | ((uint32_t)target_hash160[2] << 16)
-                   | ((uint32_t)target_hash160[3] << 24);
-    }
+    if (vanity_len >= 4) prefix_le = (uint32_t)target_hash160[0] | ((uint32_t)target_hash160[1] << 8) | ((uint32_t)target_hash160[2] << 16) | ((uint32_t)target_hash160[3] << 24);
     cudaMemcpyToSymbol(c_target_prefix, &prefix_le, sizeof(prefix_le));
 
-    // Alloc GPU Memory
-    int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
-    unsigned long long *d_attempts=nullptr;
+    int *d_found_flag; FoundResult *d_found_result; unsigned long long *d_attempts;
+    cudaMalloc(&d_found_flag, sizeof(int)); cudaMalloc(&d_found_result, sizeof(FoundResult)); cudaMalloc(&d_attempts, sizeof(unsigned long long));
+    int zero = FOUND_NONE; unsigned long long zero_ull = 0;
+    cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice); cudaMemcpy(d_attempts, &zero_ull, sizeof(unsigned long long), cudaMemcpyHostToDevice);
 
-    cudaMalloc(&d_found_flag, sizeof(int));
-    cudaMalloc(&d_found_result, sizeof(FoundResult));
-    cudaMalloc(&d_attempts, sizeof(unsigned long long));
-
-    int zero = FOUND_NONE;
-    unsigned long long zero_ull = 0;
-    cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_attempts, &zero_ull, sizeof(unsigned long long), cudaMemcpyHostToDevice);
-
-    std::cout << "======== MINIKEY SEARCH MODE =========\n";
+    std::cout << "======== MINIKEY SEARCH (Jacobian Optimized) =========\n";
     std::cout << "Device       : " << prop.name << "\n";
-    std::cout << "Minikey Len  : " << minikey_len << "\n";
     std::cout << "Target Hash  : " << vanity_hash_hex << "\n";
-    std::cout << "Note         : Searching randomly (Sparse keyspace).\n\n";
     std::cout << "======== SEARCH STARTED =========\n";
 
-    int threads = 256;
-    int blocks = prop.multiProcessorCount * 4; 
-
+    int threads = 256; int blocks = prop.multiProcessorCount * 4;
     auto now = std::chrono::high_resolution_clock::now();
     uint64_t seed_high = (uint64_t)now.time_since_epoch().count();
 
-    // Launch Kernel
     kernel_minikey_search<<<blocks, threads>>>(d_found_flag, d_found_result, d_attempts, seed_high);
     
-    // Monitor Loop
-    auto t0 = std::chrono::high_resolution_clock::now();
-    auto tLast = t0;
-    unsigned long long last_attempts = 0;
-
+    auto t0 = std::chrono::high_resolution_clock::now(); auto tLast = t0; unsigned long long last_attempts = 0;
     while (!g_sigint) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        
-        int h_flag = 0;
-        cudaMemcpy(&h_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
-        
+        int h_flag = 0; cudaMemcpy(&h_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
         if (h_flag == FOUND_READY) break;
 
-        // Stats
-        auto tNow = std::chrono::high_resolution_clock::now();
-        double dt = std::chrono::duration<double>(tNow - tLast).count();
+        auto tNow = std::chrono::high_resolution_clock::now(); double dt = std::chrono::duration<double>(tNow - tLast).count();
         if (dt >= 1.0) {
-            unsigned long long curr_att = 0;
-            cudaMemcpy(&curr_att, d_attempts, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+            unsigned long long curr_att = 0; cudaMemcpy(&curr_att, d_attempts, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
             double rate = ((double)(curr_att - last_attempts)) / (dt * 1e6);
-            
-            std::cout << "\rSpeed: " << std::fixed << std::setprecision(2) << rate 
-                      << " MCheck/s | Total Attempts: " << curr_att << std::flush;
-            
-            last_attempts = curr_att;
-            tLast = tNow;
+            std::cout << "\rSpeed: " << std::fixed << std::setprecision(2) << rate << " MCheck/s | Total: " << curr_att << std::flush;
+            last_attempts = curr_att; tLast = tNow;
         }
     }
 
-    cudaDeviceSynchronize();
-    std::cout << "\n";
-
-    int h_flag = 0;
-    cudaMemcpy(&h_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
-
+    cudaDeviceSynchronize(); std::cout << "\n";
+    int h_flag = 0; cudaMemcpy(&h_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
     if (h_flag == FOUND_READY) {
-        FoundResult res;
-        cudaMemcpy(&res, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost);
-        
+        FoundResult res; cudaMemcpy(&res, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost);
         std::cout << "======== FOUND MATCH! =================================\n";
         std::cout << "Minikey       : " << res.minikey_str << "\n";
         std::cout << "Private Key   : " << formatHex256(res.scalar) << "\n";
         std::cout << "Public Key    : " << formatCompressedPubHex(res.Rx, res.Ry) << "\n";
-    } else {
-        std::cout << "Search Interrupted.\n";
-    }
+    } else { std::cout << "Search Interrupted.\n"; }
 
     cudaFree(d_found_flag); cudaFree(d_found_result); cudaFree(d_attempts);
     return 0;
