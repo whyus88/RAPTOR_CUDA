@@ -46,7 +46,7 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 __constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_RangeStart[4]; // Batas bawah rentang
-__constant__ uint64_t c_RangeLen[4];   // Panjang rentang
+// __constant__ uint64_t c_RangeLen[4];   // Panjang rentang
 __constant__ int c_vanity_len;
 
 // ============================================================
