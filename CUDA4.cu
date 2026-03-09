@@ -56,7 +56,7 @@ __constant__ int c_vanity_len;
 #define PATTERN_RANDOM 2
 
 // ============================================================
-// KERNEL: PATTERN BASED SEARCH
+// KERNEL: PATTERN SEARCH WITHIN RANGE
 // ============================================================
 __launch_bounds__(256, 2)
 __global__ void kernel_random_search(
@@ -87,8 +87,7 @@ __global__ void kernel_random_search(
         return (rng_s1 = (s1 ^ s0 ^ (s1 >> 17) ^ (s0 >> 26))) + s0;
     };
 
-    // Fungsi helper untuk mendapatkan nibble (4-bit) sesuai tipe
-    // type: 0=Angka, 1=Huruf, 2=Acak
+    // Helper untuk mendapatkan nibble sesuai pola
     auto get_pattern_nibble = [&](int type) -> uint8_t {
         uint64_t r = xorshift128plus();
         if (type == PATTERN_DIGIT) { // Angka 0-9
@@ -134,16 +133,12 @@ __global__ void kernel_random_search(
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
         // =======================================================
-        // MODIFIKASI: PEMBANGKITAN KUNCI BERBASIS POLA
+        // BAGIAN 1: PEMBANGKITAN KUNCI BERBASIS POLA
         // =======================================================
         
-        // Kita membangun kunci dalam representasi Nibble (64 nibble = 256 bit)
-        // Nibble 0 adalah MSB (Most Significant Bit)
         uint8_t nibbles[64];
 
         // 1. Digit Konstan Pertama (Index 0)
-        // Catatan: Nilai konstan tidak diketahui, jadi kita isi acak (PATTERN_RANDOM)
-        // Jika Anda yakin konstantanya selalu '1', ganti dengan: nibbles[0] = 0x1;
         nibbles[0] = get_pattern_nibble(PATTERN_RANDOM); 
 
         // 2. Group 1 (Index 1,2,3): Huruf Angka Angka (HAA)
@@ -166,38 +161,61 @@ __global__ void kernel_random_search(
         nibbles[11] = get_pattern_nibble(PATTERN_DIGIT);
         nibbles[12] = get_pattern_nibble(PATTERN_LETTER);
 
-        // 6. 5 Digit Terakhir & Sisa (Index 13 sd 63): Acak
+        // 6. Sisa Digit (Index 13 sd 63): Acak
         for(int i = 13; i < 64; ++i) {
             nibbles[i] = get_pattern_nibble(PATTERN_RANDOM);
         }
 
-        // Packing Nibbles ke uint64_t (Little Endian Limbs)
-        // k_final[3] berisi nibble 0..15 (MSB)
-        // k_final[0] berisi nibble 48..63 (LSB)
-        uint64_t k_final[4];
-        
+        // Packing Nibbles ke uint64_t k_rand
+        uint64_t k_rand[4];
         #pragma unroll
         for (int k = 0; k < 4; ++k) {
             uint64_t val = 0;
-            // Setiap limb uint64_t menampung 16 nibble
-            // Limb index: 3 (MSB) -> 0 (LSB)
-            // Nibble index: 0..15 -> Limb 3
-            // Nibble index: 16..31 -> Limb 2
-            // ...
             int base_idx = (3 - k) * 16; 
             for (int j = 0; j < 16; ++j) {
                 val = (val << 4) | nibbles[base_idx + j];
             }
-            k_final[k] = val;
+            k_rand[k] = val;
         }
 
-        // ================== END MODIFIKASI ====================
+        // =======================================================
+        // BAGIAN 2: PENERAPAN RENTANG (RANGE MASKING)
+        // =======================================================
+        
+        uint64_t k_final[4];
+        
+        // Operasi AND 256-bit: k_final = k_rand & Mask
+        k_final[0] = k_rand[0] & c_RangeMask[0];
+        k_final[1] = k_rand[1] & c_RangeMask[1];
+        k_final[2] = k_rand[2] & c_RangeMask[2];
+        k_final[3] = k_rand[3] & c_RangeMask[3];
 
-        // 3. Hitung Titik P = k_final * G
+        // Operasi ADD 256-bit: k_final += RangeStart
+        {
+            uint64_t carry = 0;
+            __uint128_t res = (__uint128_t)k_final[0] + c_RangeStart[0];
+            k_final[0] = (uint64_t)res;
+            carry = (uint64_t)(res >> 64);
+
+            res = (__uint128_t)k_final[1] + c_RangeStart[1] + carry;
+            k_final[1] = (uint64_t)res;
+            carry = (uint64_t)(res >> 64);
+
+            res = (__uint128_t)k_final[2] + c_RangeStart[2] + carry;
+            k_final[2] = (uint64_t)res;
+            carry = (uint64_t)(res >> 64);
+
+            k_final[3] = k_final[3] + c_RangeStart[3] + carry;
+        }
+
+        // =======================================================
+        // BAGIAN 3: EKSEKUSI KURVA ELIPTIK & HASH
+        // =======================================================
+
         uint64_t x1[4], y1[4];
         scalarMulBaseAffine(k_final, x1, y1);
 
-        // 4. Cek Titik Pusat (P)
+        // Cek Titik Pusat (P)
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
@@ -224,7 +242,7 @@ __global__ void kernel_random_search(
             }
         }
 
-        // 5. Batch Neighbors Check (Optimisasi Tetap Dipertahankan)
+        // Batch Neighbors Check
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
@@ -417,16 +435,27 @@ int main(int argc, char** argv) {
     }
     int vanity_len = (int)(vanity_hash_hex.length() / 2);
 
-    // Range calculation mostly unused in Pattern Mode, but kept for initialization
+    // Hitung RangeLen
     uint64_t range_len[4]; 
     sub256(range_end, range_start, range_len); 
     add256_u64(range_len, 1ull, range_len);
+
+    // Hitung RangeMask (Len - 1)
     uint64_t range_mask[4];
     for(int i=0; i<4; ++i) range_mask[i] = range_len[i];
     uint64_t borrow = 1;
     for (int i = 0; i < 4; ++i) {
         if (range_mask[i] >= borrow) { range_mask[i] -= borrow; borrow = 0; }
         else { range_mask[i] -= borrow; borrow = 1; }
+    }
+
+    bool is_pow2 = false;
+    int bit_count = 0;
+    for(int i=0; i<4; ++i) bit_count += __builtin_popcountll(range_len[i]);
+    if (bit_count == 1) is_pow2 = true;
+
+    if (!is_pow2) {
+        std::cerr << "Warning: Range Length is NOT a power of two. Random distribution will be slightly biased.\n";
     }
 
     int device=0; cudaDeviceProp prop{};
@@ -492,9 +521,11 @@ int main(int argc, char** argv) {
         std::free(h_Gx_half); std::free(h_Gy_half);
     }
 
-    std::cout << "======== Mode: PATTERN SEARCH (Custom Logic) ========\n";
+    std::cout << "======== Mode: PATTERN SEARCH (Strict Range) ========\n";
     std::cout << "Target: 1JTK7s9YVYywfm5XUH7RNhHJH1LshCaRFR\n";
-    std::cout << "Pattern: HAA-AAH-AAA-AAH...\n";
+    std::cout << "Pattern: HAA-AAH-AAA-AAH\n";
+    std::cout << "Range Start : " << start_hex << "\n";
+    std::cout << "Range End   : " << end_hex << "\n";
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "Threads: " << threadsTotal << "\n";
     std::cout << "================================================\n";
