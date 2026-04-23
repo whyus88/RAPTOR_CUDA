@@ -1,7 +1,3 @@
-Here is the modified `README.md`. It is designed to be sleek, modern, and minimal with a distinct "hacker" aesthetic.
-
-***
-
 # 🦖 RAPTOR CUDA: GPU Key Hunter
 
 **RAPTOR CUDA** is a high-performance GPU cracker designed to hunt down Satoshi Puzzles with extreme prejudice. Built on CUDA architecture, it combines warp-level parallelism with optimized batch EC operations to deliver devastating brute-force speeds.
