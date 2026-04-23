@@ -111,7 +111,7 @@ Deploy the binary. Requires CUDA Toolkit.
 apt update && apt install -y build-essential gcc make cuda-toolkit git
 
 # Build
-git clone https://github.com/Dookoo2/CUDACyclone.git
+git clone https://github.com/11winsnew11/RAPTOR_CUDA.git
 cd CUDACyclone
 make
 ```
