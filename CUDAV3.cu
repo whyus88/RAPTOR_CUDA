@@ -55,7 +55,7 @@ __constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
 __constant__ int c_vanity_len;
 __constant__ uint64_t c_RangeStart[4];
-__constant__ uint64_t c_RangeLen[4];
+// __constant__ uint64_t c_RangeLen[4];
 
 // ============================================
 // DEVICE FUNCTION: Generate Unique Odd Stride per Thread
