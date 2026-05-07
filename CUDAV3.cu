@@ -72,10 +72,10 @@ __constant__ uint64_t c_ScalarJump[4];
 __constant__ uint32_t c_prefix_32; 
 __constant__ uint16_t c_prefix_48; 
 __constant__ uint64_t c_prefix_64; 
-__constant__ uint8_t  c_prefix_56; // Byte ke-6
+__constant__ uint8_t  c_prefix_56; 
 
 // =====================================================
-// EXTREME SHOTGUN KERNEL
+// FIXED SHOTGUN KERNEL
 // =====================================================
 __launch_bounds__(256, 2) 
 __global__ void kernel_shotgun_grasshopper(
@@ -105,7 +105,6 @@ __global__ void kernel_shotgun_grasshopper(
     const unsigned full_mask = 0xFFFFFFFFu;
     if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
-    // Load constant ke register lokal untuk akses super cepat
     const uint64_t prefix64 = c_prefix_64;
     const uint32_t prefix32 = c_prefix_32;
     const uint16_t prefix48 = c_prefix_48;
@@ -169,7 +168,6 @@ __global__ void kernel_shotgun_grasshopper(
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            // EXTREME FAST CHECK: Zero-loop branching
             bool match = false;
             if (vanity_len <= 4) match = (*(const uint32_t*)h20 == prefix32);
             else if (vanity_len <= 6) match = (*(const uint32_t*)h20 == prefix32) && (*(const uint16_t*)(h20+4) == prefix48);
@@ -220,7 +218,7 @@ __global__ void kernel_shotgun_grasshopper(
         inverse[4] = 0ull;
         _ModInv(inverse);
 
-        // --- EXTREME SHOTGUN LOOP (Parity Only) ---
+        // --- SHOTGUN LOOP (FIXED Y CALCULATION) ---
         for (int i = 0; i < half - 1; ++i) {
             if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
@@ -229,14 +227,9 @@ __global__ void kernel_shotgun_grasshopper(
 
             // +Shotgun
             {
-                uint64_t px3[4], s[4], lam[4], px_i[4];
+                uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
                 #pragma unroll
-                for (int j=0;j<4;++j) px_i[j]=c_ShotgunX[(size_t)i*4+j];
-                
-                // Hanyaambil Y_i untuk lambda (tidak disimpan lama)
-                uint64_t py_i[4];
-                #pragma unroll
-                for (int j=0;j<4;++j) py_i[j]=c_ShotgunY[(size_t)i*4+j];
+                for (int j=0;j<4;++j) { px_i[j]=c_ShotgunX[(size_t)i*4+j]; py_i[j]=c_ShotgunY[(size_t)i*4+j]; }
 
                 ModSub256(s, py_i, y1);
                 _ModMult(lam, s, dx_inv_i);
@@ -245,10 +238,12 @@ __global__ void kernel_shotgun_grasshopper(
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
 
-                // EXTREME OPTIMIZATION: Hitung Parity Y tanpa _ModMult!
-                // y3 = s * lam - y1. Karena P ganjil, paritas(y3) = (paritas(s) XOR paritas(lam)) XOR paritas(y1)
-                ModSub256(s, x1, px3); // s sekarang = x1 - px3
-                uint8_t odd = (((s[0] & 1ULL) & (lam[0] & 1ULL)) ^ (y1[0] & 1ULL)) & 1ULL;
+                // FIXED: Hitung Y yang benar untuk mendapatkan paritas yang benar
+                ModSub256(s, x1, px3); 
+                _ModMult(y3, s, lam);
+                ModSub256(y3, y3, y1);
+                
+                uint8_t odd = y3[0] & 1ULL;
 
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
@@ -261,11 +256,6 @@ __global__ void kernel_shotgun_grasshopper(
 
                 if (match) {
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        // HITUNG Y PENUH HANYA JIKA COCOK (Sangat Jarang)
-                        uint64_t y3_full[4];
-                        _ModMult(y3_full, s, lam);
-                        ModSub256(y3_full, y3_full, y1);
-
                         uint64_t fs[4], add_scalar[4]; 
                         #pragma unroll
                         for (int k=0;k<4;++k) fs[k]=S[k];
@@ -280,7 +270,7 @@ __global__ void kernel_shotgun_grasshopper(
                         #pragma unroll
                         for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
                         #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3_full[k];
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
                         d_found_result->threadId = (int)gid; d_found_result->iter = 0;
                         __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
                     }
@@ -290,7 +280,7 @@ __global__ void kernel_shotgun_grasshopper(
 
             // -Shotgun
             {
-                uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4];
+                uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
                 #pragma unroll
                 for (int j=0;j<4;++j) { px_i[j]=c_ShotgunX[(size_t)i*4+j]; py_i[j]=c_ShotgunY[(size_t)i*4+j]; }
                 ModNeg256(py_i, py_i); 
@@ -300,9 +290,12 @@ __global__ void kernel_shotgun_grasshopper(
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
 
-                // Parity Only Y check
+                // FIXED: Hitung Y yang benar
                 ModSub256(s, x1, px3); 
-                uint8_t odd = (((s[0] & 1ULL) & (lam[0] & 1ULL)) ^ (y1[0] & 1ULL)) & 1ULL;
+                _ModMult(y3, s, lam);
+                ModSub256(y3, y3, y1);
+                
+                uint8_t odd = y3[0] & 1ULL;
 
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
@@ -315,10 +308,6 @@ __global__ void kernel_shotgun_grasshopper(
 
                 if (match) {
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t y3_full[4];
-                        _ModMult(y3_full, s, lam);
-                        ModSub256(y3_full, y3_full, y1);
-
                         uint64_t fs[4], sub_scalar[4]; 
                         #pragma unroll
                         for (int k=0;k<4;++k) fs[k]=S[k];
@@ -335,7 +324,7 @@ __global__ void kernel_shotgun_grasshopper(
                         #pragma unroll
                         for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
                         #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3_full[k];
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
                         d_found_result->threadId = (int)gid; d_found_result->iter = 0;
                         __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
                     }
@@ -356,7 +345,7 @@ __global__ void kernel_shotgun_grasshopper(
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4];
+            uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
             #pragma unroll
             for (int j=0;j<4;++j) { px_i[j]=c_ShotgunX[(size_t)i*4+j]; py_i[j]=c_ShotgunY[(size_t)i*4+j]; }
             ModNeg256(py_i, py_i);
@@ -366,9 +355,12 @@ __global__ void kernel_shotgun_grasshopper(
             ModSub256(px3, px3, x1);
             ModSub256(px3, px3, px_i);
 
-            // Parity Only Y check
+            // FIXED: Hitung Y yang benar
             ModSub256(s, x1, px3);
-            uint8_t odd = (((s[0] & 1ULL) & (lam[0] & 1ULL)) ^ (y1[0] & 1ULL)) & 1ULL;
+            _ModMult(y3, s, lam);
+            ModSub256(y3, y3, y1);
+            
+            uint8_t odd = y3[0] & 1ULL;
 
             uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
@@ -381,10 +373,6 @@ __global__ void kernel_shotgun_grasshopper(
 
             if (match) {
                 if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                    uint64_t y3_full[4];
-                    _ModMult(y3_full, s, lam);
-                    ModSub256(y3_full, y3_full, y1);
-
                     uint64_t fs[4]; 
                     #pragma unroll
                     for (int k=0;k<4;++k) fs[k]=S[k];
@@ -398,17 +386,22 @@ __global__ void kernel_shotgun_grasshopper(
                     #pragma unroll
                     for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
                     #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->Ry[k]=y3_full[k];
+                    for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
                     d_found_result->threadId = (int)gid; d_found_result->iter = 0;
                     __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
+
+            uint64_t last_dx[4];
+            #pragma unroll
+            for (int j=0;j<4;++j) last_dx[j] = c_ShotgunX[(size_t)i*4 + j];
+            ModSub256(last_dx, last_dx, x1);
+            _ModMult(inverse, inverse, last_dx);
         }
 
         // =====================================================
-        // SHOTGUN JUMP: P = P + JumpPoint, S = S + scalar_jump
-        // Di sini kita WAJIB hitung Y penuh karena jadi basis shot berikutnya
+        // SHOTGUN JUMP: P = P + JumpPoint
         // =====================================================
         {
             uint64_t x_old[4], y_old[4];
@@ -431,7 +424,7 @@ __global__ void kernel_shotgun_grasshopper(
             ModSub256(x1, x1, Jx_local);
 
             ModSub256(s, x_old, x1);
-            _ModMult(y1, s, lam); // Full Y calc di sini (1x per shot, bukan per titik)
+            _ModMult(y1, s, lam); 
             ModSub256(y1, y1, y_old);
         }
 
@@ -608,7 +601,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << "Info: EXTREME SHOTGUN MODE - Stride=2^" << stride_bits << ", Shots/launch=" << shots_per_launch << "\n";
+    std::cout << "Info: SHOTGUN MODE - Stride=2^" << stride_bits << ", Shots/launch=" << shots_per_launch << "\n";
 
     uint64_t* h_start_scalars = nullptr;
     uint64_t* h_counts256 = nullptr;
@@ -641,7 +634,6 @@ int main(int argc, char** argv) {
     cudaMemcpyToSymbol(c_Stride, stride, 4*sizeof(uint64_t));
     cudaMemcpyToSymbol(c_ScalarJump, scalar_jump, 4*sizeof(uint64_t));
 
-    // Setup Extreme Fast Prefix Check Constants
     uint32_t prefix32 = 0; uint16_t prefix48 = 0; uint64_t prefix64 = 0; uint8_t prefix56 = 0;
     if (vanity_len >= 2) memcpy(&prefix32, target_hash160, 2);
     if (vanity_len >= 4) memcpy(&prefix32, target_hash160, 4);
@@ -735,14 +727,14 @@ int main(int argc, char** argv) {
         ck(cudaDeviceSynchronize(), "start points sync"); ck(cudaGetLastError(), "start points launch");
     }
 
-    std::cout << "\n======== EXTREME SHOTGUN GRASSHOPPER ===============\n";
-    std::cout << std::left << std::setw(22) << "Mode"          << " : PARITY-ONLY (Zero Y Calc)\n";
+    std::cout << "\n======== SHOTGUN GRASSHOPPER =========================\n";
+    std::cout << std::left << std::setw(22) << "Mode"          << " : SHOTGUN SPARSE SAMPLING\n";
     std::cout << std::left << std::setw(22) << "Device"        << " : " << prop.name << " (SM " << prop.multiProcessorCount << ")\n";
     std::cout << std::left << std::setw(22) << "ThreadsTotal"  << " : " << threadsTotal << "\n";
     std::cout << std::left << std::setw(22) << "Batch Size"    << " : " << B << "\n";
     std::cout << std::left << std::setw(22) << "Stride"        << " : 2^" << stride_bits << " = " << (1ULL << stride_bits) << "\n";
     std::cout << std::left << std::setw(22) << "Vanity Target" << " : " << vanity_hash_hex << " (" << vanity_len << " bytes)\n";
-    std::cout << "\n======== FIRING EXTREME SHOTS =======================\n";
+    std::cout << "\n======== FIRING SHOTS ===============================\n";
 
     cudaStream_t streamKernel;
     ck(cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking), "stream");
