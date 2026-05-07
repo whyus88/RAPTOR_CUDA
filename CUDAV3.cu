@@ -41,9 +41,9 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 #define WARP_SIZE 32
 #endif
 
-__constant__ uint8_t c_target_hash160[20];
+// __constant__ uint8_t c_target_hash160[20];
 __constant__ int c_vanity_len;
-__constant__ uint32_t c_target_prefix;
+// __constant__ uint32_t c_target_prefix;
 
 // Deklarasi Constant untuk Endomorphism dan 8-byte check
 __constant__ uint64_t c_beta[4] = {
