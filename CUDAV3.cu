@@ -625,6 +625,13 @@ static bool cmp256_lt_host(const uint64_t a[4], const uint64_t b[4]) {
     return false;
 }
 
+static bool cmp256_le_host(const uint64_t a[4], const uint64_t b[4]) {
+    for (int i = 3; i >= 0; --i) {
+        if (a[i] != b[i]) return a[i] < b[i];
+    }
+    return true; 
+}
+
 // =====================================================================
 // EXTREME FAST: Xoshiro256** RNG
 // =====================================================================
