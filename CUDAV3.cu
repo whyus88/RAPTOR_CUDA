@@ -58,8 +58,8 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 // ============================================
 // CONSTANT MEMORY (Minimal untuk Extreme Mode)
 // ============================================
-__constant__ uint32_t c_target_prefix;
-__constant__ uint8_t  c_target_hash160[20];
+// __constant__ uint32_t c_target_prefix;
+// __constant__ uint8_t  c_target_hash160[20];
 __constant__ uint32_t c_vanity_len;
 __constant__ uint32_t c_vanity_prefix_mask;
 __constant__ uint64_t c_range_start[4];
@@ -86,11 +86,6 @@ __device__ __forceinline__ uint64_t multi_hash64(uint64_t a, uint64_t b, uint64_
     h += c * 0x517CC1B727220A95ULL;
     h = (h ^ (h >> 27)) * 0x94D049BB133111EBULL;
     return h ^ (h >> 31);
-}
-
-// Helper: load 32-bit LE
-__device__ __forceinline__ uint32_t load_u32_le(const uint8_t* p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 // ============================================
@@ -717,15 +712,6 @@ void add256_host(const uint64_t a[4], const uint64_t b[4], uint64_t r[4]) {
         r[i] = (uint64_t)res;
         carry = (uint64_t)(res >> 64);
     }
-}
-
-std::string human_bytes(double bytes) {
-    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
-    int i = 0;
-    while (bytes >= 1024.0 && i < 4) { bytes /= 1024.0; ++i; }
-    std::ostringstream ss;
-    ss << std::fixed << std::setprecision(1) << bytes << " " << units[i];
-    return ss.str();
 }
 
 // ============================================
