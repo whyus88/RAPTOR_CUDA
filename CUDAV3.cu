@@ -472,7 +472,7 @@ __global__ void kernel_csp_grasshopper(
             _ModMult(lam, StrideY_minus_y1, inverse);  // inverse already computed!
             _ModSqr(x_temp, lam);
             ModSub256(x_temp, x_temp, x1);
-            ModSub256(x_temp, x_temp, active_StrideX);  // CSP: Use per-thread stride
+            ModSub256(x_temp, x_temp, (uint64_t*)active_StrideX);  // CSP: Use per-thread stride
 
             ModSub256(s, x1, x_temp);
             _ModMult(y_temp, s, lam);
