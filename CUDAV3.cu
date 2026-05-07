@@ -14,6 +14,7 @@
 #include <csignal>
 #include <atomic>
 #include <random>
+#include <vector>
 
 #include "CUDAMath.h"
 #include "sha256.h"
@@ -67,9 +68,6 @@ __device__ __forceinline__ bool cmp256_ge(const uint64_t a[4], const uint64_t b[
     return !cmp256_lt(a, b);
 }
 
-// =====================================================================
-// FIX 1: Tambahkan constant memory yang HILANG
-// =====================================================================
 __constant__ uint64_t c_ShotgunX[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_ShotgunY[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_JumpPointX[4];
@@ -79,17 +77,14 @@ __constant__ uint64_t c_RangeStart[4];
 __constant__ uint64_t c_RangeEnd[4];
 __constant__ uint64_t c_Stride[4];
 __constant__ uint64_t c_ScalarJump[4];
-// __constant__ uint64_t c_RangeLen[4];          // FIX: DITAMBAHKAN
-// __constant__ uint8_t c_target_hash160[20];    // FIX: DITAMBAHKAN
+// __constant__ uint64_t c_RangeLen[4];
+// __constant__ uint8_t c_target_hash160[20];
 
 __constant__ uint32_t c_prefix_32; 
 __constant__ uint16_t c_prefix_48; 
 __constant__ uint64_t c_prefix_64; 
 __constant__ uint8_t  c_prefix_56;
 
-// =====================================================================
-// FIX 2: Fungsi vanity check yang BENAR dan konsisten
-// =====================================================================
 __device__ __forceinline__ bool check_vanity_match(
     const uint8_t* h20, 
     int vanity_len,
@@ -98,64 +93,39 @@ __device__ __forceinline__ bool check_vanity_match(
     uint64_t prefix64,
     uint8_t prefix56)
 {
-    // Gunakan pendekatan byte-by-byte comparison yang akurat
-    // dengan optimasi menggunakan word comparison dimana memungkinkan
-    
     if (vanity_len <= 0) return true;
     
     if (vanity_len == 1) {
         return h20[0] == c_target_hash160[0];
     }
     else if (vanity_len == 2) {
-        uint16_t h = *(const uint16_t*)h20;
-        uint16_t t = *(const uint16_t*)c_target_hash160;
-        return h == t;
+        return *(const uint16_t*)h20 == *(const uint16_t*)c_target_hash160;
     }
     else if (vanity_len == 3) {
-        uint16_t h16 = *(const uint16_t*)h20;
-        uint16_t t16 = *(const uint16_t*)c_target_hash160;
-        return (h16 == t16) && (h20[2] == c_target_hash160[2]);
+        return (*(const uint16_t*)h20 == *(const uint16_t*)c_target_hash160) && 
+               (h20[2] == c_target_hash160[2]);
     }
     else if (vanity_len <= 4) {
-        uint32_t h = *(const uint32_t*)h20;
-        uint32_t t = *(const uint32_t*)c_target_hash160;
-        return h == t;
+        return *(const uint32_t*)h20 == *(const uint32_t*)c_target_hash160;
     }
     else if (vanity_len == 5) {
-        uint32_t h32 = *(const uint32_t*)h20;
-        uint32_t t32 = *(const uint32_t*)c_target_hash160;
-        return (h32 == t32) && (h20[4] == c_target_hash160[4]);
+        return (*(const uint32_t*)h20 == *(const uint32_t*)c_target_hash160) && 
+               (h20[4] == c_target_hash160[4]);
     }
     else if (vanity_len == 6) {
-        uint32_t h32 = *(const uint32_t*)h20;
-        uint32_t t32 = *(const uint32_t*)c_target_hash160;
-        uint16_t h16 = *(const uint16_t*)(h20 + 4);
-        uint16_t t16 = *(const uint16_t*)(c_target_hash160 + 4);
-        return (h32 == t32) && (h16 == t16);
+        return (*(const uint32_t*)h20 == *(const uint32_t*)c_target_hash160) && 
+               (*(const uint16_t*)(h20+4) == *(const uint16_t*)(c_target_hash160+4));
     }
     else if (vanity_len == 7) {
-        uint32_t h32 = *(const uint32_t*)h20;
-        uint32_t t32 = *(const uint32_t*)c_target_hash160;
-        uint16_t h16 = *(const uint16_t*)(h20 + 4);
-        uint16_t t16 = *(const uint16_t*)(c_target_hash160 + 4);
-        return (h32 == t32) && (h16 == t16) && (h20[6] == c_target_hash160[6]);
+        return (*(const uint32_t*)h20 == *(const uint32_t*)c_target_hash160) && 
+               (*(const uint16_t*)(h20+4) == *(const uint16_t*)(c_target_hash160+4)) && 
+               (h20[6] == c_target_hash160[6]);
     }
-    else { // vanity_len >= 8
-        uint64_t h64 = *(const uint64_t*)h20;
-        uint64_t t64 = *(const uint64_t*)c_target_hash160;
-        if (h64 != t64) return false;
-        
-        // Check remaining bytes if vanity_len > 8
-        for (int i = 8; i < vanity_len && i < 20; ++i) {
-            if (h20[i] != c_target_hash160[i]) return false;
-        }
-        return true;
+    else {
+        return *(const uint64_t*)h20 == *(const uint64_t*)c_target_hash160;
     }
 }
 
-// =====================================================================
-// FIX 3: Helper untuk cek apakah scalar valid (non-negative dan dalam range)
-// =====================================================================
 __device__ __forceinline__ bool is_scalar_valid_in_range(
     const uint64_t scalar[4],
     const uint64_t range_start[4],
@@ -164,13 +134,8 @@ __device__ __forceinline__ bool is_scalar_valid_in_range(
     return cmp256_ge(scalar, range_start) && cmp256_le(scalar, range_end);
 }
 
-// =====================================================================
-// FIX 4: Helper untuk subtract dengan cek underflow
-// =====================================================================
 __device__ __forceinline__ bool sub256_with_underflow_check(
-    const uint64_t a[4], 
-    const uint64_t b[4], 
-    uint64_t result[4])
+    const uint64_t a[4], const uint64_t b[4], uint64_t result[4])
 {
     uint64_t borrow = 0;
     for (int i = 0; i < 4; ++i) {
@@ -179,19 +144,15 @@ __device__ __forceinline__ bool sub256_with_underflow_check(
         borrow = (ai < bi) ? 1ULL : 0ULL;
         result[i] = ai - bi;
     }
-    return (borrow != 0); // true jika underflow (negatif)
+    return (borrow != 0);
 }
 
-// =====================================================================
-// FIX 5: Helper untuk compute scalar untuk +Shotgun[i]
-// =====================================================================
 __device__ __forceinline__ void compute_plus_shotgun_scalar(
     const uint64_t base_scalar[4],
     const uint64_t stride[4],
     uint64_t shot_index,
     uint64_t result[4])
 {
-    // result = base_scalar + (shot_index) * stride
     uint64_t addend[4] = {0, 0, 0, 0};
     uint64_t mult = shot_index;
     int shift = 0;
@@ -212,7 +173,6 @@ __device__ __forceinline__ void compute_plus_shotgun_scalar(
         shift++;
     }
     
-    // Add to base
     uint64_t carry = 0;
     for (int i = 0; i < 4; ++i) {
         __uint128_t res = (__uint128_t)base_scalar[i] + addend[i] + carry;
@@ -221,17 +181,12 @@ __device__ __forceinline__ void compute_plus_shotgun_scalar(
     }
 }
 
-// =====================================================================
-// FIX 6: Helper untuk compute scalar untuk -Shotgun[i]
-// Returns true jika scalar valid (non-negative)
-// =====================================================================
 __device__ __forceinline__ bool compute_minus_shotgun_scalar(
     const uint64_t base_scalar[4],
     const uint64_t stride[4],
     uint64_t shot_index,
     uint64_t result[4])
 {
-    // result = base_scalar - (shot_index) * stride
     uint64_t subtrahend[4] = {0, 0, 0, 0};
     uint64_t mult = shot_index;
     int shift = 0;
@@ -252,7 +207,6 @@ __device__ __forceinline__ bool compute_minus_shotgun_scalar(
         shift++;
     }
     
-    // Subtract from base
     return !sub256_with_underflow_check(base_scalar, subtrahend, result);
 }
 
@@ -284,32 +238,18 @@ __global__ void kernel_shotgun_grasshopper(
     const unsigned full_mask = 0xFFFFFFFFu;
     if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
-    // =====================================================================
-    // FIX 7: Load prefix values - gunakan c_target_hash160 langsung
-    // =====================================================================
     const int vanity_len = c_vanity_len;
     
-    // Load target bytes untuk comparison
     uint32_t target_prefix32 = 0;
     uint16_t target_prefix48 = 0;
     uint64_t target_prefix64 = 0;
     uint8_t  target_prefix56 = 0;
     
-    if (vanity_len >= 2) {
-        target_prefix32 = *(const uint16_t*)c_target_hash160;
-    }
-    if (vanity_len >= 4) {
-        target_prefix32 = *(const uint32_t*)c_target_hash160;
-    }
-    if (vanity_len >= 6) {
-        target_prefix48 = *(const uint16_t*)(c_target_hash160 + 4);
-    }
-    if (vanity_len >= 7) {
-        target_prefix56 = c_target_hash160[6];
-    }
-    if (vanity_len >= 8) {
-        target_prefix64 = *(const uint64_t*)c_target_hash160;
-    }
+    if (vanity_len >= 2) target_prefix32 = *(const uint16_t*)c_target_hash160;
+    if (vanity_len >= 4) target_prefix32 = *(const uint32_t*)c_target_hash160;
+    if (vanity_len >= 6) target_prefix48 = *(const uint16_t*)(c_target_hash160 + 4);
+    if (vanity_len >= 7) target_prefix56 = c_target_hash160[6];
+    if (vanity_len >= 8) target_prefix64 = *(const uint64_t*)c_target_hash160;
 
     unsigned int local_hashes = 0;
     #define FLUSH_THRESHOLD 32768u
@@ -344,7 +284,7 @@ __global__ void kernel_shotgun_grasshopper(
         range_end[i] = c_RangeEnd[i];
         scalar_jump[i] = c_ScalarJump[i];
         stride[i] = c_Stride[i];
-        range_start[i] = c_RangeStart[i];  // FIX: Load range_start
+        range_start[i] = c_RangeStart[i];
     }
 
     uint32_t shots_done = 0;
@@ -362,42 +302,34 @@ __global__ void kernel_shotgun_grasshopper(
         }
         if (carry || cmp256_gt(max_scalar, range_end)) break;
 
-        // =====================================================================
-        // FIX 8: HASH CHECK Base point - gunakan fungsi check_vanity_match
-        // =====================================================================
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            // FIX: Gunakan fungsi check_vanity_match yang benar
             bool match = check_vanity_match(h20, vanity_len, target_prefix32, 
                                             target_prefix48, target_prefix64, target_prefix56);
 
             if (__any_sync(full_mask, match)) {
-                if (match) {
-                    // FIX: Validasi scalar dalam range sebelum menyimpan
-                    if (is_scalar_valid_in_range(S, range_start, range_end)) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            d_found_result->threadId = (int)gid; 
-                            d_found_result->iter = 0;
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
-                            __threadfence_system(); 
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
+                if (match && is_scalar_valid_in_range(S, range_start, range_end)) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        d_found_result->threadId = (int)gid; 
+                        d_found_result->iter = 0;
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
+                        __threadfence_system(); 
+                        atomicExch(d_found_flag, FOUND_READY);
                     }
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
         }
 
-        // --- BATCH INVERSION ---
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
@@ -426,16 +358,13 @@ __global__ void kernel_shotgun_grasshopper(
         inverse[4] = 0ull;
         _ModInv(inverse);
 
-        // --- SHOTGUN LOOP ---
         for (int i = 0; i < half - 1; ++i) {
             if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // =====================================================================
-            // FIX 9: +Shotgun dengan scalar calculation yang BENAR
-            // =====================================================================
+            // +Shotgun
             {
                 uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
                 #pragma unroll
@@ -458,17 +387,14 @@ __global__ void kernel_shotgun_grasshopper(
                 getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                // FIX: Gunakan fungsi check_vanity_match
                 bool match = check_vanity_match(h20, vanity_len, target_prefix32,
                                                 target_prefix48, target_prefix64, target_prefix56);
 
                 if (__any_sync(full_mask, match)) {
                     if (match) {
-                        // FIX: Hitung scalar dengan benar menggunakan helper function
                         uint64_t found_scalar[4];
                         compute_plus_shotgun_scalar(S, stride, (uint64_t)(i + 1), found_scalar);
                         
-                        // FIX: Validasi scalar dalam range
                         if (is_scalar_valid_in_range(found_scalar, range_start, range_end)) {
                             if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                                 #pragma unroll
@@ -488,10 +414,7 @@ __global__ void kernel_shotgun_grasshopper(
                 }
             }
 
-            // =====================================================================
-            // FIX 10: -Shotgun dengan scalar calculation yang BENAR
-            // TIDAK melakukan wrapping - jika scalar negatif, skip
-            // =====================================================================
+            // -Shotgun
             {
                 uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
                 #pragma unroll
@@ -513,17 +436,14 @@ __global__ void kernel_shotgun_grasshopper(
                 getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                // FIX: Gunakan fungsi check_vanity_match
                 bool match = check_vanity_match(h20, vanity_len, target_prefix32,
                                                 target_prefix48, target_prefix64, target_prefix56);
 
                 if (__any_sync(full_mask, match)) {
                     if (match) {
-                        // FIX: Hitung scalar dengan benar, cek apakah valid (non-negative)
                         uint64_t found_scalar[4];
                         bool scalar_valid = compute_minus_shotgun_scalar(S, stride, (uint64_t)(i + 1), found_scalar);
                         
-                        // FIX: HANYA simpan jika scalar valid (non-negative) DAN dalam range
                         if (scalar_valid && is_scalar_valid_in_range(found_scalar, range_start, range_end)) {
                             if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                                 #pragma unroll
@@ -538,8 +458,6 @@ __global__ void kernel_shotgun_grasshopper(
                                 atomicExch(d_found_flag, FOUND_READY);
                             }
                         }
-                        // Jika scalar tidak valid (negatif), ini adalah false positive
-                        // Lanjutkan pencarian
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
@@ -552,9 +470,7 @@ __global__ void kernel_shotgun_grasshopper(
             _ModMult(inverse, inverse, sx_i);
         }
 
-        // =====================================================================
-        // FIX 11: LAST POINT -Shotgun[half-1] dengan scalar calculation BENAR
-        // =====================================================================
+        // Last -Shotgun
         {
             const int i = half - 1;
             uint64_t dx_inv_i[4];
@@ -580,17 +496,14 @@ __global__ void kernel_shotgun_grasshopper(
             getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            // FIX: Gunakan fungsi check_vanity_match
             bool match = check_vanity_match(h20, vanity_len, target_prefix32,
                                             target_prefix48, target_prefix64, target_prefix56);
 
             if (__any_sync(full_mask, match)) {
                 if (match) {
-                    // FIX: Untuk last -Shotgun, scalar = S - scalar_jump
                     uint64_t found_scalar[4];
                     bool scalar_valid = !sub256_with_underflow_check(S, scalar_jump, found_scalar);
                     
-                    // FIX: Hanya simpan jika valid
                     if (scalar_valid && is_scalar_valid_in_range(found_scalar, range_start, range_end)) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                             #pragma unroll
@@ -616,7 +529,7 @@ __global__ void kernel_shotgun_grasshopper(
             _ModMult(inverse, inverse, last_dx);
         }
 
-        // --- SHOTGUN JUMP ---
+        // Shotgun Jump
         {
             uint64_t x_old[4], y_old[4];
             #pragma unroll
@@ -673,14 +586,13 @@ __global__ void kernel_shotgun_grasshopper(
 
 // Deklarasi eksternal
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
-extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
 extern std::string formatHex256(const uint64_t limbs[4]);
 extern long double ld_from_u256(const uint64_t v[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
 // =====================================================================
-// FIX 12: Helper functions untuk operasi 256-bit di host
+// FAST HOST MATH HELPERS
 // =====================================================================
 static void sub256_host(const uint64_t a[4], const uint64_t b[4], uint64_t result[4]) {
     uint64_t borrow = 0;
@@ -713,40 +625,197 @@ static bool cmp256_lt_host(const uint64_t a[4], const uint64_t b[4]) {
     return false;
 }
 
-static bool cmp256_le_host(const uint64_t a[4], const uint64_t b[4]) {
-    return !cmp256_lt_host(b, a);
-}
+// =====================================================================
+// EXTREME FAST: Xoshiro256** RNG
+// =====================================================================
+struct Xoshiro256 {
+    uint64_t s[4];
+    
+    Xoshiro256(uint64_t seed) {
+        // SplitMix64 initialization
+        for (int i = 0; i < 4; ++i) {
+            seed += 0x9e3779b97f4a7c15ULL;
+            uint64_t z = seed;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            s[i] = z ^ (z >> 31);
+        }
+    }
+    
+    static inline uint64_t rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
+    
+    inline uint64_t next() {
+        const uint64_t result = rotl(s[1] * 5, 7) * 9;
+        const uint64_t t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = rotl(s[3], 45);
+        return result;
+    }
+};
 
 // =====================================================================
-// FIX 13: Random scalar generation yang BENAR (uniform distribution)
+// EXTREME FAST: Random scalar generation (BIT-LIMITED)
+// Tidak akan pernah stuck karena rejection rate max ~50%
 // =====================================================================
-static void generate_random_scalar_in_range(
-    std::mt19937_64& gen,
+static inline void generate_random_scalar_fast(
+    Xoshiro256& rng,
     const uint64_t range_start[4],
-    const uint64_t range_end[4],
+    const uint64_t range_span[4],
     uint64_t result[4])
 {
-    // Calculate range_span = range_end - range_start + 1
-    uint64_t range_span[4];
-    sub256_host(range_end, range_start, range_span);
-    add256_u64_host(range_span, 1ULL, range_span);
+    // Hitung jumlah bit yang diperlukan
+    int bits = 0;
+    for (int i = 3; i >= 0; --i) {
+        if (range_span[i] != 0) {
+            bits = (3 - i) * 64 + (64 - __builtin_clzll(range_span[i]));
+            break;
+        }
+    }
+    if (bits == 0) bits = 1;
     
-    // Generate random 256-bit value and reduce modulo range_span
-    // Using rejection sampling for uniformity
+    int full_words = bits / 64;
+    int remaining_bits = bits % 64;
+    if (remaining_bits == 0) { full_words--; remaining_bits = 64; }
+    
+    // Rejection sampling dengan BIT-LIMITED random
+    // Max rejection rate = ~50% (ketika range_span sedikit di atas power of 2)
     while (true) {
-        uint64_t rand_val[4];
-        for (int k = 0; k < 4; ++k) {
-            rand_val[k] = gen();
+        uint64_t rand_val[4] = {0, 0, 0, 0};
+        
+        for (int i = 0; i < full_words; ++i) {
+            rand_val[i] = rng.next();
+        }
+        if (remaining_bits < 64) {
+            rand_val[full_words] = rng.next() & ((1ULL << remaining_bits) - 1);
         }
         
-        // Check if rand_val < range_span
         if (cmp256_lt_host(rand_val, range_span)) {
-            // result = range_start + rand_val
             add256_host(range_start, rand_val, result);
             return;
         }
-        // Otherwise reject and try again (rejection sampling)
     }
+}
+
+// =====================================================================
+// EXTREME FAST: Parallel random generation
+// =====================================================================
+static void generate_random_scalars_parallel(
+    uint64_t* scalars,
+    uint64_t threadsTotal,
+    const uint64_t range_start[4],
+    const uint64_t max_start[4])
+{
+    // Pre-calculate range_span once
+    uint64_t range_span[4];
+    sub256_host(max_start, range_start, range_span);
+    add256_u64_host(range_span, 1ULL, range_span);
+    
+    // Determine number of threads
+    const int num_threads = std::min((int)std::thread::hardware_concurrency(), 16);
+    if (num_threads <= 1 || threadsTotal < 10000) {
+        // Single thread for small counts
+        Xoshiro256 rng(std::random_device{}());
+        for (uint64_t i = 0; i < threadsTotal; ++i) {
+            generate_random_scalar_fast(rng, range_start, range_span, &scalars[i * 4]);
+        }
+        return;
+    }
+    
+    // Multi-threaded generation
+    std::vector<std::thread> workers;
+    std::atomic<uint64_t> idx{0};
+    
+    auto worker = [&]() {
+        Xoshiro256 rng(std::random_device{}() + std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        
+        while (true) {
+            uint64_t i = idx.fetch_add(1, std::memory_order_relaxed);
+            if (i >= threadsTotal) break;
+            generate_random_scalar_fast(rng, range_start, range_span, &scalars[i * 4]);
+        }
+    };
+    
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back(worker);
+    }
+    for (auto& w : workers) {
+        w.join();
+    }
+}
+
+// =====================================================================
+// EXTREME FAST: Simple path untuk range yang fit dalam 64-bit
+// =====================================================================
+static bool is_zero256(const uint64_t v[4]) {
+    return (v[0] | v[1] | v[2] | v[3]) == 0;
+}
+
+static void generate_random_scalars_ultra_fast(
+    uint64_t* scalars,
+    uint64_t threadsTotal,
+    const uint64_t range_start[4],
+    const uint64_t max_start[4])
+{
+    uint64_t range_span[4];
+    sub256_host(max_start, range_start, range_span);
+    add256_u64_host(range_span, 1ULL, range_span);
+    
+    // ULTRA FAST PATH: Jika range_span fit dalam 64-bit
+    if (range_span[1] == 0 && range_span[2] == 0 && range_span[3] == 0 && range_span[0] > 0) {
+        uint64_t span64 = range_span[0];
+        
+        const int num_threads = std::min((int)std::thread::hardware_concurrency(), 16);
+        
+        if (num_threads <= 1 || threadsTotal < 10000) {
+            Xoshiro256 rng(std::random_device{}());
+            for (uint64_t i = 0; i < threadsTotal; ++i) {
+                uint64_t rand_val = rng.next() % span64;
+                
+                __uint128_t res = (__uint128_t)range_start[0] + rand_val;
+                scalars[i*4+0] = (uint64_t)res;
+                uint64_t carry = (uint64_t)(res >> 64);
+                for (int k = 1; k < 4; ++k) {
+                    res = (__uint128_t)range_start[k] + carry;
+                    scalars[i*4+k] = (uint64_t)res;
+                    carry = (uint64_t)(res >> 64);
+                }
+            }
+        } else {
+            std::vector<std::thread> workers;
+            std::atomic<uint64_t> idx{0};
+            
+            auto worker = [&]() {
+                Xoshiro256 rng(std::random_device{}() + std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                
+                while (true) {
+                    uint64_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= threadsTotal) break;
+                    
+                    uint64_t rand_val = rng.next() % span64;
+                    
+                    __uint128_t res = (__uint128_t)range_start[0] + rand_val;
+                    scalars[i*4+0] = (uint64_t)res;
+                    uint64_t carry = (uint64_t)(res >> 64);
+                    for (int k = 1; k < 4; ++k) {
+                        res = (__uint128_t)range_start[k] + carry;
+                        scalars[i*4+k] = (uint64_t)res;
+                        carry = (uint64_t)(res >> 64);
+                    }
+                }
+            };
+            
+            for (int t = 0; t < num_threads; ++t) workers.emplace_back(worker);
+            for (auto& w : workers) w.join();
+        }
+        return;
+    }
+    
+    // FALLBACK: Gunakan parallel generation untuk range 256-bit
+    generate_random_scalars_parallel(scalars, threadsTotal, range_start, max_start);
 }
 
 int main(int argc, char** argv) {
@@ -811,13 +880,9 @@ int main(int argc, char** argv) {
         std::cerr << "Error: invalid range hex\n"; return EXIT_FAILURE; 
     }
 
-    // =====================================================================
-    // FIX 14: Parse vanity hash dengan validasi yang benar
-    // =====================================================================
     uint8_t target_hash160[20];
     memset(target_hash160, 0, 20);
     
-    // Validasi panjang hex string
     if (vanity_hash_hex.length() % 2 != 0) {
         std::cerr << "Error: vanity-hash160 must have even length\n";
         return EXIT_FAILURE;
@@ -833,7 +898,6 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
     
-    // Parse hex dengan validasi
     for (size_t i = 0; i < (size_t)vanity_len; ++i) {
         std::string byteStr = vanity_hash_hex.substr(i * 2, 2);
         char* endp = nullptr;
@@ -924,11 +988,8 @@ int main(int argc, char** argv) {
     uint64_t* h_counts256 = nullptr;
     cudaHostAlloc(&h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
     cudaHostAlloc(&h_counts256, threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
     
-    // Calculate max valid start scalar (must leave room for scalar_jump)
+    // Calculate max valid start scalar
     uint64_t max_start[4];
     {
         uint64_t borrow = 0;
@@ -937,56 +998,69 @@ int main(int argc, char** argv) {
             borrow = (range_end[i] < sub) ? 1 : 0;
             max_start[i] = range_end[i] - sub;
         }
-        // If there was borrow, max_start would be negative - cap at range_start
         if (borrow) {
             memcpy(max_start, range_start, sizeof(range_start));
         }
     }
 
     // =====================================================================
-    // FIX 15: Gunakan random scalar generation yang benar
+    // FIX: ULTRA FAST random generation
     // =====================================================================
-    std::cout << "Info: Generating random start scalars...\n";
-    for (uint64_t i = 0; i < threadsTotal; ++i) {
-        uint64_t rand_scalar[4];
-        generate_random_scalar_in_range(gen, range_start, max_start, rand_scalar);
+    {
+        auto t_gen_start = std::chrono::high_resolution_clock::now();
         
-        memcpy(&h_start_scalars[i*4], rand_scalar, 4 * sizeof(uint64_t));
+        generate_random_scalars_ultra_fast(h_start_scalars, threadsTotal, range_start, max_start);
         
-        uint64_t remaining[4];
-        sub256(range_end, rand_scalar, remaining);
-        add256_u64(remaining, 1ull, remaining);
-        memcpy(&h_counts256[i*4], remaining, 4 * sizeof(uint64_t));
+        // Calculate counts in parallel too
+        const int num_threads = std::min((int)std::thread::hardware_concurrency(), 16);
+        if (num_threads > 1 && threadsTotal >= 10000) {
+            std::vector<std::thread> workers;
+            std::atomic<uint64_t> idx{0};
+            
+            auto worker = [&]() {
+                while (true) {
+                    uint64_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= threadsTotal) break;
+                    
+                    uint64_t remaining[4];
+                    sub256_host(range_end, &h_start_scalars[i*4], remaining);
+                    add256_u64_host(remaining, 1ull, remaining);
+                    memcpy(&h_counts256[i*4], remaining, 4 * sizeof(uint64_t));
+                }
+            };
+            
+            for (int t = 0; t < num_threads; ++t) workers.emplace_back(worker);
+            for (auto& w : workers) w.join();
+        } else {
+            for (uint64_t i = 0; i < threadsTotal; ++i) {
+                uint64_t remaining[4];
+                sub256_host(range_end, &h_start_scalars[i*4], remaining);
+                add256_u64_host(remaining, 1ull, remaining);
+                memcpy(&h_counts256[i*4], remaining, 4 * sizeof(uint64_t));
+            }
+        }
+        
+        auto t_gen_end = std::chrono::high_resolution_clock::now();
+        double gen_time_ms = std::chrono::duration<double, std::milli>(t_gen_end - t_gen_start).count();
+        std::cout << "Info: Generated " << threadsTotal << " random scalars in " 
+                  << std::fixed << std::setprecision(1) << gen_time_ms << " ms\n";
     }
 
-    // =====================================================================
-    // FIX 16: Copy ke constant memory dengan benar
-    // =====================================================================
-    cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);  // FIX: Sekarang ada deklarasinya
+    cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
     cudaMemcpyToSymbol(c_vanity_len, &vanity_len, sizeof(int));
     cudaMemcpyToSymbol(c_RangeStart, range_start, 4*sizeof(uint64_t));
     cudaMemcpyToSymbol(c_RangeEnd, range_end, 4*sizeof(uint64_t));
-    cudaMemcpyToSymbol(c_RangeLen, range_len, 4*sizeof(uint64_t));  // FIX: Sekarang ada deklarasinya
+    cudaMemcpyToSymbol(c_RangeLen, range_len, 4*sizeof(uint64_t));
     cudaMemcpyToSymbol(c_Stride, stride, 4*sizeof(uint64_t));
     cudaMemcpyToSymbol(c_ScalarJump, scalar_jump, 4*sizeof(uint64_t));
 
-    // =====================================================================
-    // FIX 17: Inisialisasi prefix dengan benar
-    // =====================================================================
     uint32_t prefix32 = 0; 
     uint16_t prefix48 = 0; 
     uint64_t prefix64 = 0; 
     uint8_t  prefix56 = 0;
     
-    // Clear semua terlebih dahulu
-    memset(&prefix32, 0, sizeof(prefix32));
-    memset(&prefix48, 0, sizeof(prefix48));
-    memset(&prefix64, 0, sizeof(prefix64));
-    prefix56 = 0;
-    
-    // Fill berdasarkan vanity_len dengan benar
     if (vanity_len >= 2) memcpy(&prefix32, target_hash160, 2);
-    if (vanity_len >= 4) memcpy(&prefix32, target_hash160, 4);  // Override untuk 4 byte
+    if (vanity_len >= 4) memcpy(&prefix32, target_hash160, 4);
     if (vanity_len >= 6) memcpy(&prefix48, target_hash160 + 4, 2);
     if (vanity_len >= 7) prefix56 = target_hash160[6];
     if (vanity_len >= 8) memcpy(&prefix64, target_hash160, 8);
@@ -1067,12 +1141,8 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(h_Sy, d_Sy, half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Sy");
         ck(cudaMemcpyToSymbol(c_ShotgunX, h_Sx, half * 4 * sizeof(uint64_t)), "ToSymbol ShotgunX");
         ck(cudaMemcpyToSymbol(c_ShotgunY, h_Sy, half * 4 * sizeof(uint64_t)), "ToSymbol ShotgunY");
-        cudaFree(d_shotgun_scalars); 
-        cudaFree(d_Sx); 
-        cudaFree(d_Sy);
-        std::free(h_shotgun_scalars); 
-        std::free(h_Sx); 
-        std::free(h_Sy);
+        cudaFree(d_shotgun_scalars); cudaFree(d_Sx); cudaFree(d_Sy);
+        std::free(h_shotgun_scalars); std::free(h_Sx); std::free(h_Sy);
     }
 
     std::cout << "Info: Precomputing Jump point...\n";
@@ -1092,9 +1162,7 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(hJy, d_Jy, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jy");
         ck(cudaMemcpyToSymbol(c_JumpPointX, hJx, 4 * sizeof(uint64_t)), "ToSymbol JumpX");
         ck(cudaMemcpyToSymbol(c_JumpPointY, hJy, 4 * sizeof(uint64_t)), "ToSymbol JumpY");
-        cudaFree(d_jump_s); 
-        cudaFree(d_Jx); 
-        cudaFree(d_Jy);
+        cudaFree(d_jump_s); cudaFree(d_Jx); cudaFree(d_Jy);
     }
 
     std::cout << "Info: Precomputing start points...\n";
@@ -1105,9 +1173,6 @@ int main(int argc, char** argv) {
         ck(cudaGetLastError(), "start points launch");
     }
 
-    // =====================================================================
-    // FIX 18: Display info dengan nilai yang benar untuk debugging
-    // =====================================================================
     std::cout << "\n======== SHOTGUN GRASSHOPPER =========================\n";
     std::cout << std::left << std::setw(22) << "Mode"          << " : SHOTGUN SPARSE SAMPLING\n";
     std::cout << std::left << std::setw(22) << "Device"        << " : " << prop.name << " (SM " << prop.multiProcessorCount << ")\n";
@@ -1192,14 +1257,13 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost), "read any_left");
         if (h_any == 0u) {
             std::cout << "\nInfo: Boundary reached. Reinitializing random starts...\n";
-            // =====================================================================
-            // FIX 19: Gunakan random generation yang benar saat reinitialize
-            // =====================================================================
-            for (uint64_t i = 0; i < threadsTotal; ++i) {
-                uint64_t rand_scalar[4];
-                generate_random_scalar_in_range(gen, range_start, max_start, rand_scalar);
-                memcpy(&h_start_scalars[i*4], rand_scalar, 4 * sizeof(uint64_t));
-            }
+            
+            auto t_reinit = std::chrono::high_resolution_clock::now();
+            generate_random_scalars_ultra_fast(h_start_scalars, threadsTotal, range_start, max_start);
+            double reinit_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t_reinit).count();
+            std::cout << "Info: Reinitialization took " << std::fixed << std::setprecision(1) << reinit_ms << " ms\n";
+            
             ck(cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "reinit start");
             int blocks_scal = (threadsTotal + threadsPerBlock - 1) / threadsPerBlock;
             scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
@@ -1219,15 +1283,11 @@ int main(int argc, char** argv) {
         FoundResult host_result{};
         ck(cudaMemcpy(&host_result, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost), "read result");
         
-        // =====================================================================
-        // FIX 20: Validasi hasil sebelum ditampilkan
-        // =====================================================================
         std::cout << "\n========== BOOM! TARGET FOUND! =====================\n";
         std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
         std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
         std::cout << "Found by Thread: " << host_result.threadId << "\n";
         
-        // Verify scalar is in range
         bool in_range = cmp256_le_host(host_result.scalar, range_end) && 
                        !cmp256_lt_host(host_result.scalar, range_start);
         std::cout << "Scalar in Range: " << (in_range ? "YES" : "NO - WARNING!") << "\n";
