@@ -77,7 +77,7 @@ __constant__ uint64_t c_RangeStart[4];
 __constant__ uint64_t c_RangeEnd[4];
 __constant__ uint64_t c_Stride[4];
 __constant__ uint64_t c_ScalarJump[4];
-__constant__ uint64_t c_RangeLen[4]; // ✅ FIX: Di-uncomment agar cudaMemcpyToSymbol tidak error
+__constant__ uint64_t c_RangeLen[4]; 
 
 __constant__ uint32_t c_prefix_32; 
 __constant__ uint16_t c_prefix_48; 
