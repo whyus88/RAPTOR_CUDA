@@ -55,9 +55,6 @@ __device__ __forceinline__ bool cmp256_le(const uint64_t a[4], const uint64_t b[
     return !cmp256_gt(a, b);
 }
 
-// =====================================================
-// CONSTANT MEMORY
-// =====================================================
 __constant__ uint64_t c_ShotgunX[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_ShotgunY[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_JumpPointX[4];
@@ -68,15 +65,11 @@ __constant__ uint64_t c_RangeEnd[4];
 __constant__ uint64_t c_Stride[4];
 __constant__ uint64_t c_ScalarJump[4];
 
-// EXTREME OPTIMIZATION: Pre-calculated integer blocks untuk cek instan
 __constant__ uint32_t c_prefix_32; 
 __constant__ uint16_t c_prefix_48; 
 __constant__ uint64_t c_prefix_64; 
 __constant__ uint8_t  c_prefix_56; 
 
-// =====================================================
-// FIXED SHOTGUN KERNEL
-// =====================================================
 __launch_bounds__(256, 2) 
 __global__ void kernel_shotgun_grasshopper(
     const uint64_t* __restrict__ Px,
@@ -174,16 +167,19 @@ __global__ void kernel_shotgun_grasshopper(
             else if (vanity_len == 7) match = (*(const uint64_t*)h20 == prefix64) && (h20[6] == prefix56);
             else match = (*(const uint64_t*)h20 == prefix64);
 
-            if (match) {
-                if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                    d_found_result->threadId = (int)gid; d_found_result->iter = 0;
-                    #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
-                    #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
-                    #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
-                    __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+            // FIX DEADLOCK: Gunakan __any_sync agar SEMUA thread ikut return bersamaan
+            if (__any_sync(full_mask, match)) {
+                if (match) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        d_found_result->threadId = (int)gid; d_found_result->iter = 0;
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
+                        __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                    }
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
@@ -218,7 +214,7 @@ __global__ void kernel_shotgun_grasshopper(
         inverse[4] = 0ull;
         _ModInv(inverse);
 
-        // --- SHOTGUN LOOP (FIXED Y CALCULATION) ---
+        // --- SHOTGUN LOOP ---
         for (int i = 0; i < half - 1; ++i) {
             if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
@@ -238,7 +234,6 @@ __global__ void kernel_shotgun_grasshopper(
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
 
-                // FIXED: Hitung Y yang benar untuk mendapatkan paritas yang benar
                 ModSub256(s, x1, px3); 
                 _ModMult(y3, s, lam);
                 ModSub256(y3, y3, y1);
@@ -254,25 +249,28 @@ __global__ void kernel_shotgun_grasshopper(
                 else if (vanity_len == 7) match = (*(const uint64_t*)h20 == prefix64) && (h20[6] == prefix56);
                 else match = (*(const uint64_t*)h20 == prefix64);
 
-                if (match) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t fs[4], add_scalar[4]; 
-                        #pragma unroll
-                        for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t addv = (uint64_t)(i + 1);
-                        #pragma unroll
-                        for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)stride[k] * addv; add_scalar[k] = (uint64_t)res; }
-                        uint64_t c = 0;
-                        #pragma unroll
-                        for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + add_scalar[k] + c; fs[k] = (uint64_t)res; c = (uint64_t)(res >> 64); }
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                        d_found_result->threadId = (int)gid; d_found_result->iter = 0;
-                        __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                // FIX DEADLOCK
+                if (__any_sync(full_mask, match)) {
+                    if (match) {
+                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                            uint64_t fs[4], add_scalar[4]; 
+                            #pragma unroll
+                            for (int k=0;k<4;++k) fs[k]=S[k];
+                            uint64_t addv = (uint64_t)(i + 1);
+                            #pragma unroll
+                            for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)stride[k] * addv; add_scalar[k] = (uint64_t)res; }
+                            uint64_t c = 0;
+                            #pragma unroll
+                            for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + add_scalar[k] + c; fs[k] = (uint64_t)res; c = (uint64_t)(res >> 64); }
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid; d_found_result->iter = 0;
+                            __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                        }
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
@@ -290,7 +288,6 @@ __global__ void kernel_shotgun_grasshopper(
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
 
-                // FIXED: Hitung Y yang benar
                 ModSub256(s, x1, px3); 
                 _ModMult(y3, s, lam);
                 ModSub256(y3, y3, y1);
@@ -306,27 +303,30 @@ __global__ void kernel_shotgun_grasshopper(
                 else if (vanity_len == 7) match = (*(const uint64_t*)h20 == prefix64) && (h20[6] == prefix56);
                 else match = (*(const uint64_t*)h20 == prefix64);
 
-                if (match) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t fs[4], sub_scalar[4]; 
-                        #pragma unroll
-                        for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t subv = (uint64_t)(i + 1);
-                        #pragma unroll
-                        for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)stride[k] * subv; sub_scalar[k] = (uint64_t)res; }
-                        uint64_t borrow = 0;
-                        #pragma unroll
-                        for (int k=0;k<4;++k) { uint64_t val = fs[k]; uint64_t sub = sub_scalar[k] + borrow; borrow = (val < sub) ? 1ull : 0ull; fs[k] = val - sub; }
-                        #pragma unroll
-                        for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + c_RangeLen[k] + borrow; fs[k] = (uint64_t)res; borrow = (uint64_t)(res >> 64); }
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                        d_found_result->threadId = (int)gid; d_found_result->iter = 0;
-                        __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                // FIX DEADLOCK
+                if (__any_sync(full_mask, match)) {
+                    if (match) {
+                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                            uint64_t fs[4], sub_scalar[4]; 
+                            #pragma unroll
+                            for (int k=0;k<4;++k) fs[k]=S[k];
+                            uint64_t subv = (uint64_t)(i + 1);
+                            #pragma unroll
+                            for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)stride[k] * subv; sub_scalar[k] = (uint64_t)res; }
+                            uint64_t borrow = 0;
+                            #pragma unroll
+                            for (int k=0;k<4;++k) { uint64_t val = fs[k]; uint64_t sub = sub_scalar[k] + borrow; borrow = (val < sub) ? 1ull : 0ull; fs[k] = val - sub; }
+                            #pragma unroll
+                            for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + c_RangeLen[k] + borrow; fs[k] = (uint64_t)res; borrow = (uint64_t)(res >> 64); }
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid; d_found_result->iter = 0;
+                            __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                        }
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
@@ -355,7 +355,6 @@ __global__ void kernel_shotgun_grasshopper(
             ModSub256(px3, px3, x1);
             ModSub256(px3, px3, px_i);
 
-            // FIXED: Hitung Y yang benar
             ModSub256(s, x1, px3);
             _ModMult(y3, s, lam);
             ModSub256(y3, y3, y1);
@@ -371,24 +370,27 @@ __global__ void kernel_shotgun_grasshopper(
             else if (vanity_len == 7) match = (*(const uint64_t*)h20 == prefix64) && (h20[6] == prefix56);
             else match = (*(const uint64_t*)h20 == prefix64);
 
-            if (match) {
-                if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                    uint64_t fs[4]; 
-                    #pragma unroll
-                    for (int k=0;k<4;++k) fs[k]=S[k];
-                    uint64_t borrow = 0;
-                    #pragma unroll
-                    for (int k=0;k<4;++k) { uint64_t val = fs[k]; uint64_t sub = scalar_jump[k] + borrow; borrow = (val < sub) ? 1ull : 0ull; fs[k] = val - sub; }
-                    #pragma unroll
-                    for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + c_RangeLen[k] + borrow; fs[k] = (uint64_t)res; borrow = (uint64_t)(res >> 64); }
-                    #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                    #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                    #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                    d_found_result->threadId = (int)gid; d_found_result->iter = 0;
-                    __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+            // FIX DEADLOCK
+            if (__any_sync(full_mask, match)) {
+                if (match) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        uint64_t fs[4]; 
+                        #pragma unroll
+                        for (int k=0;k<4;++k) fs[k]=S[k];
+                        uint64_t borrow = 0;
+                        #pragma unroll
+                        for (int k=0;k<4;++k) { uint64_t val = fs[k]; uint64_t sub = scalar_jump[k] + borrow; borrow = (val < sub) ? 1ull : 0ull; fs[k] = val - sub; }
+                        #pragma unroll
+                        for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + c_RangeLen[k] + borrow; fs[k] = (uint64_t)res; borrow = (uint64_t)(res >> 64); }
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                        #pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                        d_found_result->threadId = (int)gid; d_found_result->iter = 0;
+                        __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                    }
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
@@ -400,9 +402,7 @@ __global__ void kernel_shotgun_grasshopper(
             _ModMult(inverse, inverse, last_dx);
         }
 
-        // =====================================================
-        // SHOTGUN JUMP: P = P + JumpPoint
-        // =====================================================
+        // --- SHOTGUN JUMP ---
         {
             uint64_t x_old[4], y_old[4];
             #pragma unroll
@@ -415,7 +415,6 @@ __global__ void kernel_shotgun_grasshopper(
             ModSub256(Jy_minus_y1, Jy_minus_y1, y_old);
 
             _ModMult(lam, Jy_minus_y1, inverse);
-            
             _ModSqr(x1, lam);
             ModSub256(x1, x1, x_old);
             uint64_t Jx_local[4]; 
