@@ -1256,25 +1256,60 @@ int main(int argc, char** argv) {
         std::cout.flush();
         if (stop_all || g_sigint) break;
 
-        std::swap(d_Px, d_Rx);
-        std::swap(d_Py, d_Ry);
-
         unsigned int h_any = 0u;
         ck(cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost), "read any_left");
         if (h_any == 0u) {
             std::cout << "\nInfo: Boundary reached. Reinitializing random starts...\n";
             
             auto t_reinit = std::chrono::high_resolution_clock::now();
+            
+            // Generate new random scalars
             generate_random_scalars_ultra_fast(h_start_scalars, threadsTotal, range_start, max_start);
+            
+            const int num_threads_ct = std::min((int)std::thread::hardware_concurrency(), 16);
+            if (num_threads_ct > 1 && threadsTotal >= 10000) {
+                std::vector<std::thread> workers;
+                std::atomic<uint64_t> idx{0};
+                
+                auto worker = [&]() {
+                    while (true) {
+                        uint64_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= threadsTotal) break;
+                        
+                        uint64_t remaining[4];
+                        sub256_host(range_end, &h_start_scalars[i*4], remaining);
+                        add256_u64_host(remaining, 1ull, remaining);
+                        memcpy(&h_counts256[i*4], remaining, 4 * sizeof(uint64_t));
+                    }
+                };
+                
+                for (int t = 0; t < num_threads_ct; ++t) workers.emplace_back(worker);
+                for (auto& w : workers) w.join();
+            } else {
+                for (uint64_t i = 0; i < threadsTotal; ++i) {
+                    uint64_t remaining[4];
+                    sub256_host(range_end, &h_start_scalars[i*4], remaining);
+                    add256_u64_host(remaining, 1ull, remaining);
+                    memcpy(&h_counts256[i*4], remaining, 4 * sizeof(uint64_t));
+                }
+            }
+            
             double reinit_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t_reinit).count();
             std::cout << "Info: Reinitialization took " << std::fixed << std::setprecision(1) << reinit_ms << " ms\n";
             
+            // Copy to device
             ck(cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "reinit start");
+            ck(cudaMemcpy(d_counts256, h_counts256, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "reinit counts");
+            
+            // Compute new start points - write DIRECTLY to d_Px, d_Py (no swap needed)
             int blocks_scal = (threadsTotal + threadsPerBlock - 1) / threadsPerBlock;
             scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
             ck(cudaDeviceSynchronize(), "reinit sync"); 
             ck(cudaGetLastError(), "reinit launch");
+        } else {
+            std::swap(d_Px, d_Rx);
+            std::swap(d_Py, d_Ry);
         }
     }
 
