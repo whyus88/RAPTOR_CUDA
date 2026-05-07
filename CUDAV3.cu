@@ -1328,7 +1328,7 @@ int main(int argc, char** argv) {
                           << " | Progress: " << std::setprecision(4) << progress << "%";
                 if (eta > 0 && eta < 86400 * 365) {
                     int hours = (int)(eta / 3600);
-                    int mins = (int)((eta % 3600) / 60);
+                    int mins = (int)(std::fmod(eta, 3600.0) / 60.0);
                     std::cout << " | ETA: " << hours << "h" << mins << "m";
                 }
                 std::cout.flush();
