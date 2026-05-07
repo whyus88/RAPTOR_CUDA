@@ -79,7 +79,7 @@ __constant__ uint64_t c_RangeStart[4];
 __constant__ uint64_t c_RangeEnd[4];
 __constant__ uint64_t c_Stride[4];
 __constant__ uint64_t c_ScalarJump[4];
-__constant__ uint64_t c_RangeLen[4];          // FIX: DITAMBAHKAN
+// __constant__ uint64_t c_RangeLen[4];          // FIX: DITAMBAHKAN
 // __constant__ uint8_t c_target_hash160[20];    // FIX: DITAMBAHKAN
 
 __constant__ uint32_t c_prefix_32; 
