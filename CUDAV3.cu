@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "CUDAMath.h"
-#include "sha256.h"      // Asumsi ini ada untuk verifikasi host
+#include "sha256.h"
 #include "CUDAHash.cuh"
 #include "CUDAUtils.h"
 #include "CUDAStructures.h"
@@ -46,7 +46,6 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 #define WARP_SIZE 32
 #endif
 
-// ... (Fungsi cmp256_gt, cmp256_le, dll tetap sama) ...
 __device__ __forceinline__ bool cmp256_gt(const uint64_t a[4], const uint64_t b[4]) {
     if (a[3] != b[3]) return a[3] > b[3];
     if (a[2] != b[2]) return a[2] > b[2];
@@ -78,15 +77,14 @@ __constant__ uint64_t c_RangeStart[4];
 __constant__ uint64_t c_RangeEnd[4];
 __constant__ uint64_t c_Stride[4];
 __constant__ uint64_t c_ScalarJump[4];
+// __constant__ uint64_t c_RangeLen[4];
+// __constant__ uint8_t c_target_hash160[20];
 
 __constant__ uint32_t c_prefix_32; 
 __constant__ uint16_t c_prefix_48; 
 __constant__ uint64_t c_prefix_64; 
 __constant__ uint8_t  c_prefix_56;
 
-// ==========================================================
-// PERBAIKAN: check_vanity_match menggunakan argumen register
-// ==========================================================
 __device__ __forceinline__ bool check_vanity_match(
     const uint8_t* h20, 
     int vanity_len,
@@ -95,47 +93,35 @@ __device__ __forceinline__ bool check_vanity_match(
     uint64_t prefix64,
     uint8_t prefix56)
 {
-    // Jika len <= 0, anggap tidak ada filter (return true), 
-    // tapi seharusnya len selalu > 0 jika user input benar.
-    if (vanity_len <= 0) return true; 
     
-    // Matching 1 byte
     if (vanity_len == 1) {
         return h20[0] == c_target_hash160[0];
     }
-    // Matching 2 bytes
     else if (vanity_len == 2) {
         return *(const uint16_t*)h20 == *(const uint16_t*)c_target_hash160;
     }
-    // Matching 3 bytes
     else if (vanity_len == 3) {
         return (*(const uint16_t*)h20 == *(const uint16_t*)c_target_hash160) && 
                (h20[2] == c_target_hash160[2]);
     }
-    // Matching 4 bytes
-    else if (vanity_len == 4) {
-        // Gunakan argumen prefix32 yang sudah di-load ke register
-        return *(const uint32_t*)h20 == prefix32;
+    else if (vanity_len <= 4) {
+        return *(const uint32_t*)h20 == *(const uint32_t*)c_target_hash160;
     }
-    // Matching 5 bytes
     else if (vanity_len == 5) {
-        return (*(const uint32_t*)h20 == prefix32) && 
+        return (*(const uint32_t*)h20 == *(const uint32_t*)c_target_hash160) && 
                (h20[4] == c_target_hash160[4]);
     }
-    // Matching 6 bytes
     else if (vanity_len == 6) {
-        return (*(const uint32_t*)h20 == prefix32) && 
-               (*(const uint16_t*)(h20+4) == prefix48);
+        return (*(const uint32_t*)h20 == *(const uint32_t*)c_target_hash160) && 
+               (*(const uint16_t*)(h20+4) == *(const uint16_t*)(c_target_hash160+4));
     }
-    // Matching 7 bytes
     else if (vanity_len == 7) {
-        return (*(const uint32_t*)h20 == prefix32) && 
-               (*(const uint16_t*)(h20+4) == prefix48) && 
-               (h20[6] == prefix56);
+        return (*(const uint32_t*)h20 == *(const uint32_t*)c_target_hash160) && 
+               (*(const uint16_t*)(h20+4) == *(const uint16_t*)(c_target_hash160+4)) && 
+               (h20[6] == c_target_hash160[6]);
     }
-    // Matching 8 bytes atau lebih (menggunakan prefix64)
     else {
-        return *(const uint64_t*)h20 == prefix64;
+        return *(const uint64_t*)h20 == *(const uint64_t*)c_target_hash160;
     }
 }
 
@@ -147,7 +133,6 @@ __device__ __forceinline__ bool is_scalar_valid_in_range(
     return cmp256_ge(scalar, range_start) && cmp256_le(scalar, range_end);
 }
 
-// ... (Fungsi helper sub256, compute_plus_shotgun_scalar dll biarkan sama) ...
 __device__ __forceinline__ bool sub256_with_underflow_check(
     const uint64_t a[4], const uint64_t b[4], uint64_t result[4])
 {
@@ -224,7 +209,6 @@ __device__ __forceinline__ bool compute_minus_shotgun_scalar(
     return !sub256_with_underflow_check(base_scalar, subtrahend, result);
 }
 
-
 __launch_bounds__(256, 2) 
 __global__ void kernel_shotgun_grasshopper(
     const uint64_t* __restrict__ Px,
@@ -253,17 +237,19 @@ __global__ void kernel_shotgun_grasshopper(
     const unsigned full_mask = 0xFFFFFFFFu;
     if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
-    // ==========================================
-    // PERBAIKAN UTAMA: Ambil vanity_len dari konstan
-    // ==========================================
-    const int vanity_len = c_vanity_len; 
+    const int vanity_len = c_vanity_len;
     
-    // Load prefixes ke register (optimasi)
     uint32_t target_prefix32 = c_prefix_32;
-    uint16_t target_prefix48 = c_prefix_48;
-    uint64_t target_prefix64 = c_prefix_64;
-    uint8_t  target_prefix56 = c_prefix_56;
+    uint16_t target_prefix48 = 0;
+    uint64_t target_prefix64 = 0;
+    uint8_t  target_prefix56 = 0;
     
+    if (vanity_len >= 2) target_prefix32 = *(const uint16_t*)c_target_hash160;
+    if (vanity_len >= 4) target_prefix32 = *(const uint32_t*)c_target_hash160;
+    if (vanity_len >= 6) target_prefix48 = *(const uint16_t*)(c_target_hash160 + 4);
+    if (vanity_len >= 7) target_prefix56 = c_target_hash160[6];
+    if (vanity_len >= 8) target_prefix64 = *(const uint64_t*)c_target_hash160;
+
     unsigned int local_hashes = 0;
     #define FLUSH_THRESHOLD 32768u
     #define WARP_FLUSH_HASHES() do { \
@@ -321,7 +307,6 @@ __global__ void kernel_shotgun_grasshopper(
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            // Gunakan fungsi yang sudah diperbaiki
             bool match = check_vanity_match(h20, vanity_len, target_prefix32, 
                                             target_prefix48, target_prefix64, target_prefix56);
 
@@ -344,11 +329,6 @@ __global__ void kernel_shotgun_grasshopper(
             }
         }
 
-        // ... (Sisa logika perhitungan shotgun + dan - tetap sama persis) ...
-        // Untuk menghemat ruang, bagian tengah kernel yang tidak berubah tidak saya tulis ulang,
-        // tetapi PASTIKAN semua pemanggilan `check_vanity_match` di dalam loop 
-        // menggunakan variabel `target_prefix32`, dll yang sudah di-load di atas.
-        
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
@@ -383,7 +363,7 @@ __global__ void kernel_shotgun_grasshopper(
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // +Shotgun Logic
+            // +Shotgun
             {
                 uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
                 #pragma unroll
@@ -433,7 +413,7 @@ __global__ void kernel_shotgun_grasshopper(
                 }
             }
 
-            // -Shotgun Logic
+            // -Shotgun
             {
                 uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
                 #pragma unroll
@@ -603,13 +583,16 @@ __global__ void kernel_shotgun_grasshopper(
     #undef FLUSH_THRESHOLD
 }
 
-// ... (Fungsi helper Host Math tetap sama) ...
+// Deklarasi eksternal
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern std::string formatHex256(const uint64_t limbs[4]);
 extern long double ld_from_u256(const uint64_t v[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
+// =====================================================================
+// FAST HOST MATH HELPERS
+// =====================================================================
 static void sub256_host(const uint64_t a[4], const uint64_t b[4], uint64_t result[4]) {
     uint64_t borrow = 0;
     for (int i = 0; i < 4; ++i) {
@@ -648,11 +631,14 @@ static bool cmp256_le_host(const uint64_t a[4], const uint64_t b[4]) {
     return true; 
 }
 
-// ... (Xoshiro256 RNG dan helper lainnya tetap sama) ...
+// =====================================================================
+// EXTREME FAST: Xoshiro256** RNG
+// =====================================================================
 struct Xoshiro256 {
     uint64_t s[4];
     
     Xoshiro256(uint64_t seed) {
+        // SplitMix64 initialization
         for (int i = 0; i < 4; ++i) {
             seed += 0x9e3779b97f4a7c15ULL;
             uint64_t z = seed;
@@ -677,12 +663,17 @@ struct Xoshiro256 {
     }
 };
 
+// =====================================================================
+// EXTREME FAST: Random scalar generation (BIT-LIMITED)
+// Tidak akan pernah stuck karena rejection rate max ~50%
+// =====================================================================
 static inline void generate_random_scalar_fast(
     Xoshiro256& rng,
     const uint64_t range_start[4],
     const uint64_t range_span[4],
     uint64_t result[4])
 {
+    // Hitung jumlah bit yang diperlukan
     int bits = 0;
     for (int i = 3; i >= 0; --i) {
         if (range_span[i] != 0) {
@@ -696,6 +687,8 @@ static inline void generate_random_scalar_fast(
     int remaining_bits = bits % 64;
     if (remaining_bits == 0) { full_words--; remaining_bits = 64; }
     
+    // Rejection sampling dengan BIT-LIMITED random
+    // Max rejection rate = ~50% (ketika range_span sedikit di atas power of 2)
     while (true) {
         uint64_t rand_val[4] = {0, 0, 0, 0};
         
@@ -713,6 +706,60 @@ static inline void generate_random_scalar_fast(
     }
 }
 
+// =====================================================================
+// EXTREME FAST: Parallel random generation
+// =====================================================================
+static void generate_random_scalars_parallel(
+    uint64_t* scalars,
+    uint64_t threadsTotal,
+    const uint64_t range_start[4],
+    const uint64_t max_start[4])
+{
+    // Pre-calculate range_span once
+    uint64_t range_span[4];
+    sub256_host(max_start, range_start, range_span);
+    add256_u64_host(range_span, 1ULL, range_span);
+    
+    // Determine number of threads
+    const int num_threads = std::min((int)std::thread::hardware_concurrency(), 16);
+    if (num_threads <= 1 || threadsTotal < 10000) {
+        // Single thread for small counts
+        Xoshiro256 rng(std::random_device{}());
+        for (uint64_t i = 0; i < threadsTotal; ++i) {
+            generate_random_scalar_fast(rng, range_start, range_span, &scalars[i * 4]);
+        }
+        return;
+    }
+    
+    // Multi-threaded generation
+    std::vector<std::thread> workers;
+    std::atomic<uint64_t> idx{0};
+    
+    auto worker = [&]() {
+        Xoshiro256 rng(std::random_device{}() + std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        
+        while (true) {
+            uint64_t i = idx.fetch_add(1, std::memory_order_relaxed);
+            if (i >= threadsTotal) break;
+            generate_random_scalar_fast(rng, range_start, range_span, &scalars[i * 4]);
+        }
+    };
+    
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back(worker);
+    }
+    for (auto& w : workers) {
+        w.join();
+    }
+}
+
+// =====================================================================
+// EXTREME FAST: Simple path untuk range yang fit dalam 64-bit
+// =====================================================================
+static bool is_zero256(const uint64_t v[4]) {
+    return (v[0] | v[1] | v[2] | v[3]) == 0;
+}
+
 static void generate_random_scalars_ultra_fast(
     uint64_t* scalars,
     uint64_t threadsTotal,
@@ -723,6 +770,7 @@ static void generate_random_scalars_ultra_fast(
     sub256_host(max_start, range_start, range_span);
     add256_u64_host(range_span, 1ULL, range_span);
     
+    // ULTRA FAST PATH: Jika range_span fit dalam 64-bit
     if (range_span[1] == 0 && range_span[2] == 0 && range_span[3] == 0 && range_span[0] > 0) {
         uint64_t span64 = range_span[0];
         
@@ -772,22 +820,8 @@ static void generate_random_scalars_ultra_fast(
         return;
     }
     
-    // Fallback parallel logic (simplified for brevity, assumes larger range logic)
-    const int num_threads = std::min((int)std::thread::hardware_concurrency(), 16);
-    std::vector<std::thread> workers;
-    std::atomic<uint64_t> idx{0};
-    
-    auto worker = [&]() {
-        Xoshiro256 rng(std::random_device{}() + std::hash<std::thread::id>{}(std::this_thread::get_id()));
-        while (true) {
-            uint64_t i = idx.fetch_add(1, std::memory_order_relaxed);
-            if (i >= threadsTotal) break;
-            generate_random_scalar_fast(rng, range_start, range_span, &scalars[i * 4]);
-        }
-    };
-    
-    for (int t = 0; t < num_threads; ++t) workers.emplace_back(worker);
-    for (auto& w : workers) w.join();
+    // FALLBACK: Gunakan parallel generation untuk range 256-bit
+    generate_random_scalars_parallel(scalars, threadsTotal, range_start, max_start);
 }
 
 int main(int argc, char** argv) {
@@ -799,26 +833,49 @@ int main(int argc, char** argv) {
     uint32_t shots_per_launch = 256;  
     uint32_t stride_bits = 16;        
 
-    // ... (Parsing arguments tetap sama) ...
+    auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
+        size_t comma = s.find(',');
+        if (comma == std::string::npos) return false;
+        auto trim = [](std::string& z){
+            size_t p1 = z.find_first_not_of(" \t");
+            size_t p2 = z.find_last_not_of(" \t");
+            if (p1 == std::string::npos) { z.clear(); return; }
+            z = z.substr(p1, p2 - p1 + 1);
+        };
+        std::string a_str = s.substr(0, comma);
+        std::string b_str = s.substr(comma + 1);
+        trim(a_str); trim(b_str);
+        if (a_str.empty() || b_str.empty()) return false;
+        char* endp=nullptr;
+        unsigned long aa = std::strtoul(a_str.c_str(), &endp, 10); if (*endp) return false;
+        endp=nullptr;
+        unsigned long bb = std::strtoul(b_str.c_str(), &endp, 10); if (*endp) return false;
+        if (aa == 0ul || bb == 0ul) return false;
+        a_out=(uint32_t)aa; b_out=(uint32_t)bb; return true;
+    };
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if      (arg == "--vanity-hash160" && i + 1 < argc) vanity_hash_hex = argv[++i];
         else if (arg == "--range"          && i + 1 < argc) range_hex       = argv[++i];
         else if (arg == "--grid"           && i + 1 < argc) {
-             // parse grid logic
+            uint32_t a=0,b=0;
+            if (!parse_grid(argv[++i], a, b)) { std::cerr << "Error: --grid expects \"A,B\"\n"; return EXIT_FAILURE; }
+            runtime_batch_size = a;
+            runtime_batches_per_sm = b;
         }
         else if (arg == "--shots" && i + 1 < argc) shots_per_launch = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         else if (arg == "--stride-bits" && i + 1 < argc) {
             stride_bits = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
+            if (stride_bits < 8 || stride_bits > 24) { std::cerr << "Error: --stride-bits must be 8-24\n"; return EXIT_FAILURE; }
         }
     }
 
     if (range_hex.empty() || vanity_hash_hex.empty()) {
-        std::cerr << "Usage: " << argv[0] << " --range <start:end> --vanity-hash160 <hex> [options]\n";
+        std::cerr << "Usage: " << argv[0] << " --range <start:end> --vanity-hash160 <hex> [--grid A,B] [--shots N] [--stride-bits N]\n";
         return EXIT_FAILURE;
     }
 
-    // Parse Range
     size_t colon_pos = range_hex.find(':');
     if (colon_pos == std::string::npos) { std::cerr << "Error: range format must be start:end\n"; return EXIT_FAILURE; }
     std::string start_hex = range_hex.substr(0, colon_pos);
@@ -829,20 +886,22 @@ int main(int argc, char** argv) {
         std::cerr << "Error: invalid range hex\n"; return EXIT_FAILURE; 
     }
 
-    // Parse Target Hash160
     uint8_t target_hash160[20];
     memset(target_hash160, 0, 20);
     
     if (vanity_hash_hex.length() % 2 != 0) {
-        std::cerr << "Error: vanity-hash160 must have even length\n"; return EXIT_FAILURE;
+        std::cerr << "Error: vanity-hash160 must have even length\n";
+        return EXIT_FAILURE;
     }
     if (vanity_hash_hex.length() > 40) {
-        std::cerr << "Error: vanity-hash160 must be at most 20 bytes\n"; return EXIT_FAILURE;
+        std::cerr << "Error: vanity-hash160 must be at most 20 bytes (40 hex chars)\n";
+        return EXIT_FAILURE;
     }
     
     int vanity_len = (int)(vanity_hash_hex.length() / 2);
     if (vanity_len <= 0) {
-        std::cerr << "Error: vanity-hash160 must be at least 1 byte\n"; return EXIT_FAILURE;
+        std::cerr << "Error: vanity-hash160 must be at least 1 byte\n";
+        return EXIT_FAILURE;
     }
     
     for (size_t i = 0; i < (size_t)vanity_len; ++i) {
@@ -850,26 +909,52 @@ int main(int argc, char** argv) {
         char* endp = nullptr;
         unsigned long val = std::strtoul(byteStr.c_str(), &endp, 16);
         if (*endp != '\0' || val > 255) {
-            std::cerr << "Error: invalid hex in vanity-hash160\n"; return EXIT_FAILURE;
+            std::cerr << "Error: invalid hex in vanity-hash160 at position " << (i*2) << "\n";
+            return EXIT_FAILURE;
         }
         target_hash160[i] = (uint8_t)val;
     }
 
-    // Device Setup
+    auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
+    if (!is_pow2(runtime_batch_size) || (runtime_batch_size & 1u)) { 
+        std::cerr << "Error: batch size must be even power of two\n"; return EXIT_FAILURE; 
+    }
+    if (runtime_batch_size > MAX_BATCH_SIZE) { 
+        std::cerr << "Error: batch size > " << MAX_BATCH_SIZE << "\n"; return EXIT_FAILURE; 
+    }
+
+    uint64_t range_len[4]; 
+    sub256(range_end, range_start, range_len); 
+    add256_u64(range_len, 1ull, range_len);
+
+    auto clz256 = [](const uint64_t a[4])->int {
+        for (int i = 3; i >= 0; --i) { if (a[i] != 0) return __builtin_clzll(a[i]) + (3 - i) * 64; }
+        return 256;
+    };
+    int range_bits = 256 - clz256(range_len);
+    
+    if (stride_bits > range_bits - 8) {
+        stride_bits = range_bits - 8;
+        std::cout << "Info: Auto-adjusted stride-bits to " << stride_bits << "\n";
+    }
+
     int device=0; cudaDeviceProp prop{};
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) { 
         std::cerr<<"CUDA init error\n"; return EXIT_FAILURE; 
     }
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
-    // Grid Config
     int threadsPerBlock = 256;
+    if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock = prop.maxThreadsPerBlock;
+
     const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t);
     size_t totalGlobalMem = prop.totalGlobalMem;
     uint64_t usableMem = (totalGlobalMem > 64ull*1024*1024) ? (totalGlobalMem - 64ull*1024*1024) : (totalGlobalMem / 2);
     uint64_t maxThreadsByMem = usableMem / bytesPerThread;
+
     uint64_t userUpper = (uint64_t)prop.multiProcessorCount * (uint64_t)runtime_batches_per_sm * (uint64_t)threadsPerBlock;
     if (userUpper == 0ull) userUpper = UINT64_MAX;
+
     uint64_t threadsTotal = std::min(maxThreadsByMem, userUpper);
     threadsTotal = threadsTotal - (threadsTotal % threadsPerBlock);
     if (threadsTotal == 0) threadsTotal = threadsPerBlock;
@@ -878,7 +963,6 @@ int main(int argc, char** argv) {
     const uint32_t B = runtime_batch_size;
     const uint32_t half = B >> 1;
     
-    // Stride & Jump Calculation
     uint64_t stride[4] = {0};
     stride[stride_bits / 64] = 1ULL << (stride_bits % 64);
     
@@ -904,14 +988,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << "Info: SHOTGUN MODE - Stride=2^" << stride_bits << "\n";
+    std::cout << "Info: SHOTGUN MODE - Stride=2^" << stride_bits << ", Shots/launch=" << shots_per_launch << "\n";
 
-    // Host Memory
     uint64_t* h_start_scalars = nullptr;
     uint64_t* h_counts256 = nullptr;
     cudaHostAlloc(&h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
     cudaHostAlloc(&h_counts256, threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
     
+    // Calculate max valid start scalar
     uint64_t max_start[4];
     {
         uint64_t borrow = 0;
@@ -920,14 +1004,20 @@ int main(int argc, char** argv) {
             borrow = (range_end[i] < sub) ? 1 : 0;
             max_start[i] = range_end[i] - sub;
         }
-        if (borrow) memcpy(max_start, range_start, sizeof(range_start));
+        if (borrow) {
+            memcpy(max_start, range_start, sizeof(range_start));
+        }
     }
 
-    // Init Random Starts
+    // =====================================================================
+    // FIX: ULTRA FAST random generation
+    // =====================================================================
     {
         auto t_gen_start = std::chrono::high_resolution_clock::now();
+        
         generate_random_scalars_ultra_fast(h_start_scalars, threadsTotal, range_start, max_start);
         
+        // Calculate counts in parallel too
         const int num_threads = std::min((int)std::thread::hardware_concurrency(), 16);
         if (num_threads > 1 && threadsTotal >= 10000) {
             std::vector<std::thread> workers;
@@ -955,19 +1045,18 @@ int main(int argc, char** argv) {
                 memcpy(&h_counts256[i*4], remaining, 4 * sizeof(uint64_t));
             }
         }
+        
+        auto t_gen_end = std::chrono::high_resolution_clock::now();
+        double gen_time_ms = std::chrono::duration<double, std::milli>(t_gen_end - t_gen_start).count();
+        std::cout << "Info: Generated " << threadsTotal << " random scalars in " 
+                  << std::fixed << std::setprecision(1) << gen_time_ms << " ms\n";
     }
 
-    // Copy Constants
     cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
     cudaMemcpyToSymbol(c_vanity_len, &vanity_len, sizeof(int));
     cudaMemcpyToSymbol(c_RangeStart, range_start, 4*sizeof(uint64_t));
     cudaMemcpyToSymbol(c_RangeEnd, range_end, 4*sizeof(uint64_t));
-    
-    uint64_t range_len[4]; 
-    sub256_host(range_end, range_start, range_len); 
-    add256_u64_host(range_len, 1ull, range_len);
     cudaMemcpyToSymbol(c_RangeLen, range_len, 4*sizeof(uint64_t));
-    
     cudaMemcpyToSymbol(c_Stride, stride, 4*sizeof(uint64_t));
     cudaMemcpyToSymbol(c_ScalarJump, scalar_jump, 4*sizeof(uint64_t));
 
@@ -977,7 +1066,7 @@ int main(int argc, char** argv) {
     uint8_t  prefix56 = 0;
     
     if (vanity_len >= 2) memcpy(&prefix32, target_hash160, 2);
-    if (vanity_len >= 4) memcpy(&prefix32, target_hash160, 4); // Overwrite fully
+    if (vanity_len >= 4) memcpy(&prefix32, target_hash160, 4);
     if (vanity_len >= 6) memcpy(&prefix48, target_hash160 + 4, 2);
     if (vanity_len >= 7) prefix56 = target_hash160[6];
     if (vanity_len >= 8) memcpy(&prefix64, target_hash160, 8);
@@ -987,7 +1076,6 @@ int main(int argc, char** argv) {
     cudaMemcpyToSymbol(c_prefix_56, &prefix56, sizeof(prefix56));
     cudaMemcpyToSymbol(c_prefix_64, &prefix64, sizeof(prefix64));
 
-    // Device Memory
     uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
     int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
     unsigned long long *d_hashes_accum=nullptr; unsigned int *d_any_left=nullptr;
@@ -1019,7 +1107,6 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes"); 
     }
 
-    // Precompute Shotgun Table
     std::cout << "Info: Precomputing Shotgun table...\n";
     {
         uint64_t* h_shotgun_scalars = (uint64_t*)std::malloc(half * 4 * sizeof(uint64_t));
@@ -1053,7 +1140,7 @@ int main(int argc, char** argv) {
         int blocks_scal = (half + threadsPerBlock - 1) / threadsPerBlock;
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_shotgun_scalars, d_Sx, d_Sy, half);
         ck(cudaDeviceSynchronize(), "shotgun table sync"); 
-        
+        ck(cudaGetLastError(), "shotgun table launch");
         uint64_t* h_Sx = (uint64_t*)std::malloc(half * 4 * sizeof(uint64_t));
         uint64_t* h_Sy = (uint64_t*)std::malloc(half * 4 * sizeof(uint64_t));
         ck(cudaMemcpy(h_Sx, d_Sx, half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Sx");
@@ -1064,7 +1151,6 @@ int main(int argc, char** argv) {
         std::free(h_shotgun_scalars); std::free(h_Sx); std::free(h_Sy);
     }
 
-    // Precompute Jump Point
     std::cout << "Info: Precomputing Jump point...\n";
     {
         uint64_t h_jump_scalar[4]; 
@@ -1076,6 +1162,7 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(d_jump_s, h_jump_scalar, 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy jump_s");
         scalarMulKernelBase<<<1, 1>>>(d_jump_s, d_Jx, d_Jy, 1);
         ck(cudaDeviceSynchronize(), "jump point sync"); 
+        ck(cudaGetLastError(), "jump point launch");
         uint64_t hJx[4], hJy[4];
         ck(cudaMemcpy(hJx, d_Jx, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jx");
         ck(cudaMemcpy(hJy, d_Jy, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jy");
@@ -1084,20 +1171,25 @@ int main(int argc, char** argv) {
         cudaFree(d_jump_s); cudaFree(d_Jx); cudaFree(d_Jy);
     }
 
-    // Precompute Start Points
     std::cout << "Info: Precomputing start points...\n";
     {
         int blocks_scal = (threadsTotal + threadsPerBlock - 1) / threadsPerBlock;
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
         ck(cudaDeviceSynchronize(), "start points sync"); 
+        ck(cudaGetLastError(), "start points launch");
     }
 
     std::cout << "\n======== SHOTGUN GRASSHOPPER =========================\n";
     std::cout << std::left << std::setw(22) << "Mode"          << " : SHOTGUN SPARSE SAMPLING\n";
-    std::cout << std::left << std::setw(22) << "Device"        << " : " << prop.name << "\n";
+    std::cout << std::left << std::setw(22) << "Device"        << " : " << prop.name << " (SM " << prop.multiProcessorCount << ")\n";
     std::cout << std::left << std::setw(22) << "ThreadsTotal"  << " : " << threadsTotal << "\n";
     std::cout << std::left << std::setw(22) << "Batch Size"    << " : " << B << "\n";
-    std::cout << std::left << std::setw(22) << "Vanity Target" << " : " << vanity_hash_hex << "\n";
+    std::cout << std::left << std::setw(22) << "Stride"        << " : 2^" << stride_bits << " = " << (1ULL << stride_bits) << "\n";
+    std::cout << std::left << std::setw(22) << "Vanity Target" << " : ";
+    for (int i = 0; i < vanity_len; ++i) {
+        std::cout << std::hex << std::setfill('0') << std::setw(2) << (int)target_hash160[i];
+    }
+    std::cout << std::dec << " (" << vanity_len << " bytes)\n";
     std::cout << "\n======== FIRING SHOTS ===============================\n";
 
     cudaStream_t streamKernel;
@@ -1136,11 +1228,15 @@ int main(int argc, char** argv) {
                 double delta = (double)(h_hashes - lastHashes);
                 double mkeys = delta / (dt * 1e6);
                 double elapsed = std::chrono::duration<double>(now - t0).count();
+                long double total_keys_ld = ld_from_u256(range_len);
+                long double coverage = 0.0L;
+                if (total_keys_ld > 0.0L) coverage = ((long double)h_hashes / total_keys_ld) * 100.0L;
                 
                 std::cout << "\r[Shot #" << std::setw(4) << launch_count << "] "
                           << "Time: " << std::fixed << std::setprecision(1) << elapsed << "s | "
                           << "Speed: " << std::setprecision(2) << mkeys << " Mkeys/s | "
-                          << "Hashes: " << h_hashes << "   ";
+                          << "Hashes: " << h_hashes << " | "
+                          << "Coverage: " << std::setprecision(6) << (double)coverage << "%   ";
                 std::cout.flush();
                 lastHashes = h_hashes; 
                 tLast = now;
@@ -1167,11 +1263,18 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost), "read any_left");
         if (h_any == 0u) {
             std::cout << "\nInfo: Boundary reached. Reinitializing random starts...\n";
+            
+            auto t_reinit = std::chrono::high_resolution_clock::now();
             generate_random_scalars_ultra_fast(h_start_scalars, threadsTotal, range_start, max_start);
+            double reinit_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t_reinit).count();
+            std::cout << "Info: Reinitialization took " << std::fixed << std::setprecision(1) << reinit_ms << " ms\n";
+            
             ck(cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "reinit start");
             int blocks_scal = (threadsTotal + threadsPerBlock - 1) / threadsPerBlock;
             scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
             ck(cudaDeviceSynchronize(), "reinit sync"); 
+            ck(cudaGetLastError(), "reinit launch");
         }
     }
 
@@ -1186,28 +1289,14 @@ int main(int argc, char** argv) {
         FoundResult host_result{};
         ck(cudaMemcpy(&host_result, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost), "read result");
         
-        // ==========================================
-        // VERIFIKASI HOST (Mencegah False Positive)
-        // ==========================================
-        // Disini kita hitung hash dari Private Key yang ditemukan menggunakan CPU
-        // Untuk memastikan 100% benar.
-        // Asumsi: getHash160_33_from_limbs di GPU dan SHA256+RIPEMD160 di CPU sama.
-        // Karena kita tidak punya implementasi host hash di kode ini, kita hanya print Key nya.
-        
-        std::cout << "\n========== POTENTIAL TARGET FOUND! =================\n";
+        std::cout << "\n========== BOOM! TARGET FOUND! =====================\n";
         std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
-        std::cout << "Public Key X  : " << formatHex256(host_result.Rx) << "\n";
-        std::cout << "Public Key Y  : " << formatHex256(host_result.Ry) << "\n";
+        std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
         std::cout << "Found by Thread: " << host_result.threadId << "\n";
         
         bool in_range = cmp256_le_host(host_result.scalar, range_end) && 
                        !cmp256_lt_host(host_result.scalar, range_start);
         std::cout << "Scalar in Range: " << (in_range ? "YES" : "NO - WARNING!") << "\n";
-        
-        std::cout << "\nINFO: Verifikasi hasil dengan tool eksternal (misal 'bit' atau python ecdsa):\n";
-        std::cout << "python3 -c \"import hashlib; import base58; from binascii import unhexlify; "
-                  << "priv='" << formatHex256(host_result.scalar) << "'; "
-                  << "print('Check Address')\"\n"; 
     } else {
         if (g_sigint) { 
             std::cout << "========== INTERRUPTED ==============================\n"; 
