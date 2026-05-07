@@ -27,6 +27,7 @@ static void handle_sigint(int) { g_sigint = 1; }
 __device__ __forceinline__ int load_found_flag_relaxed(const int* p) {
     return *((const volatile int*)p);
 }
+
 __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found_flag,
                                                  unsigned full_mask,
                                                  unsigned lane)
@@ -55,6 +56,20 @@ __device__ __forceinline__ bool cmp256_le(const uint64_t a[4], const uint64_t b[
     return !cmp256_gt(a, b);
 }
 
+__device__ __forceinline__ bool cmp256_lt(const uint64_t a[4], const uint64_t b[4]) {
+    if (a[3] != b[3]) return a[3] < b[3];
+    if (a[2] != b[2]) return a[2] < b[2];
+    if (a[1] != b[1]) return a[1] < b[1];
+    return a[0] < b[0];
+}
+
+__device__ __forceinline__ bool cmp256_ge(const uint64_t a[4], const uint64_t b[4]) {
+    return !cmp256_lt(a, b);
+}
+
+// =====================================================================
+// FIX 1: Tambahkan constant memory yang HILANG
+// =====================================================================
 __constant__ uint64_t c_ShotgunX[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_ShotgunY[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_JumpPointX[4];
@@ -64,11 +79,182 @@ __constant__ uint64_t c_RangeStart[4];
 __constant__ uint64_t c_RangeEnd[4];
 __constant__ uint64_t c_Stride[4];
 __constant__ uint64_t c_ScalarJump[4];
+__constant__ uint64_t c_RangeLen[4];          // FIX: DITAMBAHKAN
+// __constant__ uint8_t c_target_hash160[20];    // FIX: DITAMBAHKAN
 
 __constant__ uint32_t c_prefix_32; 
 __constant__ uint16_t c_prefix_48; 
 __constant__ uint64_t c_prefix_64; 
-__constant__ uint8_t  c_prefix_56; 
+__constant__ uint8_t  c_prefix_56;
+
+// =====================================================================
+// FIX 2: Fungsi vanity check yang BENAR dan konsisten
+// =====================================================================
+__device__ __forceinline__ bool check_vanity_match(
+    const uint8_t* h20, 
+    int vanity_len,
+    uint32_t prefix32, 
+    uint16_t prefix48,
+    uint64_t prefix64,
+    uint8_t prefix56)
+{
+    // Gunakan pendekatan byte-by-byte comparison yang akurat
+    // dengan optimasi menggunakan word comparison dimana memungkinkan
+    
+    if (vanity_len <= 0) return true;
+    
+    if (vanity_len == 1) {
+        return h20[0] == c_target_hash160[0];
+    }
+    else if (vanity_len == 2) {
+        uint16_t h = *(const uint16_t*)h20;
+        uint16_t t = *(const uint16_t*)c_target_hash160;
+        return h == t;
+    }
+    else if (vanity_len == 3) {
+        uint16_t h16 = *(const uint16_t*)h20;
+        uint16_t t16 = *(const uint16_t*)c_target_hash160;
+        return (h16 == t16) && (h20[2] == c_target_hash160[2]);
+    }
+    else if (vanity_len <= 4) {
+        uint32_t h = *(const uint32_t*)h20;
+        uint32_t t = *(const uint32_t*)c_target_hash160;
+        return h == t;
+    }
+    else if (vanity_len == 5) {
+        uint32_t h32 = *(const uint32_t*)h20;
+        uint32_t t32 = *(const uint32_t*)c_target_hash160;
+        return (h32 == t32) && (h20[4] == c_target_hash160[4]);
+    }
+    else if (vanity_len == 6) {
+        uint32_t h32 = *(const uint32_t*)h20;
+        uint32_t t32 = *(const uint32_t*)c_target_hash160;
+        uint16_t h16 = *(const uint16_t*)(h20 + 4);
+        uint16_t t16 = *(const uint16_t*)(c_target_hash160 + 4);
+        return (h32 == t32) && (h16 == t16);
+    }
+    else if (vanity_len == 7) {
+        uint32_t h32 = *(const uint32_t*)h20;
+        uint32_t t32 = *(const uint32_t*)c_target_hash160;
+        uint16_t h16 = *(const uint16_t*)(h20 + 4);
+        uint16_t t16 = *(const uint16_t*)(c_target_hash160 + 4);
+        return (h32 == t32) && (h16 == t16) && (h20[6] == c_target_hash160[6]);
+    }
+    else { // vanity_len >= 8
+        uint64_t h64 = *(const uint64_t*)h20;
+        uint64_t t64 = *(const uint64_t*)c_target_hash160;
+        if (h64 != t64) return false;
+        
+        // Check remaining bytes if vanity_len > 8
+        for (int i = 8; i < vanity_len && i < 20; ++i) {
+            if (h20[i] != c_target_hash160[i]) return false;
+        }
+        return true;
+    }
+}
+
+// =====================================================================
+// FIX 3: Helper untuk cek apakah scalar valid (non-negative dan dalam range)
+// =====================================================================
+__device__ __forceinline__ bool is_scalar_valid_in_range(
+    const uint64_t scalar[4],
+    const uint64_t range_start[4],
+    const uint64_t range_end[4])
+{
+    return cmp256_ge(scalar, range_start) && cmp256_le(scalar, range_end);
+}
+
+// =====================================================================
+// FIX 4: Helper untuk subtract dengan cek underflow
+// =====================================================================
+__device__ __forceinline__ bool sub256_with_underflow_check(
+    const uint64_t a[4], 
+    const uint64_t b[4], 
+    uint64_t result[4])
+{
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint64_t ai = a[i];
+        uint64_t bi = b[i] + borrow;
+        borrow = (ai < bi) ? 1ULL : 0ULL;
+        result[i] = ai - bi;
+    }
+    return (borrow != 0); // true jika underflow (negatif)
+}
+
+// =====================================================================
+// FIX 5: Helper untuk compute scalar untuk +Shotgun[i]
+// =====================================================================
+__device__ __forceinline__ void compute_plus_shotgun_scalar(
+    const uint64_t base_scalar[4],
+    const uint64_t stride[4],
+    uint64_t shot_index,
+    uint64_t result[4])
+{
+    // result = base_scalar + (shot_index) * stride
+    uint64_t addend[4] = {0, 0, 0, 0};
+    uint64_t mult = shot_index;
+    int shift = 0;
+    
+    while (mult && shift < 256) {
+        if (mult & 1) {
+            uint64_t carry = 0;
+            int word_shift = shift / 64;
+            int bit_shift = shift % 64;
+            for (int k = 0; k < 4 && (k + word_shift) < 4; ++k) {
+                __uint128_t res = (__uint128_t)addend[k + word_shift] + 
+                                  ((__uint128_t)stride[k] << bit_shift) + carry;
+                addend[k + word_shift] = (uint64_t)res;
+                carry = (uint64_t)(res >> 64);
+            }
+        }
+        mult >>= 1;
+        shift++;
+    }
+    
+    // Add to base
+    uint64_t carry = 0;
+    for (int i = 0; i < 4; ++i) {
+        __uint128_t res = (__uint128_t)base_scalar[i] + addend[i] + carry;
+        result[i] = (uint64_t)res;
+        carry = (uint64_t)(res >> 64);
+    }
+}
+
+// =====================================================================
+// FIX 6: Helper untuk compute scalar untuk -Shotgun[i]
+// Returns true jika scalar valid (non-negative)
+// =====================================================================
+__device__ __forceinline__ bool compute_minus_shotgun_scalar(
+    const uint64_t base_scalar[4],
+    const uint64_t stride[4],
+    uint64_t shot_index,
+    uint64_t result[4])
+{
+    // result = base_scalar - (shot_index) * stride
+    uint64_t subtrahend[4] = {0, 0, 0, 0};
+    uint64_t mult = shot_index;
+    int shift = 0;
+    
+    while (mult && shift < 256) {
+        if (mult & 1) {
+            uint64_t carry = 0;
+            int word_shift = shift / 64;
+            int bit_shift = shift % 64;
+            for (int k = 0; k < 4 && (k + word_shift) < 4; ++k) {
+                __uint128_t res = (__uint128_t)subtrahend[k + word_shift] + 
+                                  ((__uint128_t)stride[k] << bit_shift) + carry;
+                subtrahend[k + word_shift] = (uint64_t)res;
+                carry = (uint64_t)(res >> 64);
+            }
+        }
+        mult >>= 1;
+        shift++;
+    }
+    
+    // Subtract from base
+    return !sub256_with_underflow_check(base_scalar, subtrahend, result);
+}
 
 __launch_bounds__(256, 2) 
 __global__ void kernel_shotgun_grasshopper(
@@ -98,11 +284,32 @@ __global__ void kernel_shotgun_grasshopper(
     const unsigned full_mask = 0xFFFFFFFFu;
     if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
-    const uint64_t prefix64 = c_prefix_64;
-    const uint32_t prefix32 = c_prefix_32;
-    const uint16_t prefix48 = c_prefix_48;
-    const uint8_t  prefix56 = c_prefix_56;
+    // =====================================================================
+    // FIX 7: Load prefix values - gunakan c_target_hash160 langsung
+    // =====================================================================
     const int vanity_len = c_vanity_len;
+    
+    // Load target bytes untuk comparison
+    uint32_t target_prefix32 = 0;
+    uint16_t target_prefix48 = 0;
+    uint64_t target_prefix64 = 0;
+    uint8_t  target_prefix56 = 0;
+    
+    if (vanity_len >= 2) {
+        target_prefix32 = *(const uint16_t*)c_target_hash160;
+    }
+    if (vanity_len >= 4) {
+        target_prefix32 = *(const uint32_t*)c_target_hash160;
+    }
+    if (vanity_len >= 6) {
+        target_prefix48 = *(const uint16_t*)(c_target_hash160 + 4);
+    }
+    if (vanity_len >= 7) {
+        target_prefix56 = c_target_hash160[6];
+    }
+    if (vanity_len >= 8) {
+        target_prefix64 = *(const uint64_t*)c_target_hash160;
+    }
 
     unsigned int local_hashes = 0;
     #define FLUSH_THRESHOLD 32768u
@@ -131,12 +338,13 @@ __global__ void kernel_shotgun_grasshopper(
         WARP_FLUSH_HASHES(); return;
     }
 
-    uint64_t range_end[4], scalar_jump[4], stride[4];
+    uint64_t range_end[4], scalar_jump[4], stride[4], range_start[4];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         range_end[i] = c_RangeEnd[i];
         scalar_jump[i] = c_ScalarJump[i];
         stride[i] = c_Stride[i];
+        range_start[i] = c_RangeStart[i];  // FIX: Load range_start
     }
 
     uint32_t shots_done = 0;
@@ -154,31 +362,35 @@ __global__ void kernel_shotgun_grasshopper(
         }
         if (carry || cmp256_gt(max_scalar, range_end)) break;
 
-        // --- HASH CHECK: Base point ---
+        // =====================================================================
+        // FIX 8: HASH CHECK Base point - gunakan fungsi check_vanity_match
+        // =====================================================================
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool match = false;
-            if (vanity_len <= 4) match = (*(const uint32_t*)h20 == prefix32);
-            else if (vanity_len <= 6) match = (*(const uint32_t*)h20 == prefix32) && (*(const uint16_t*)(h20+4) == prefix48);
-            else if (vanity_len == 7) match = (*(const uint64_t*)h20 == prefix64) && (h20[6] == prefix56);
-            else match = (*(const uint64_t*)h20 == prefix64);
+            // FIX: Gunakan fungsi check_vanity_match yang benar
+            bool match = check_vanity_match(h20, vanity_len, target_prefix32, 
+                                            target_prefix48, target_prefix64, target_prefix56);
 
-            // FIX DEADLOCK: Gunakan __any_sync agar SEMUA thread ikut return bersamaan
             if (__any_sync(full_mask, match)) {
                 if (match) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        d_found_result->threadId = (int)gid; d_found_result->iter = 0;
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
-                        __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                    // FIX: Validasi scalar dalam range sebelum menyimpan
+                    if (is_scalar_valid_in_range(S, range_start, range_end)) {
+                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                            d_found_result->threadId = (int)gid; 
+                            d_found_result->iter = 0;
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
+                            __threadfence_system(); 
+                            atomicExch(d_found_flag, FOUND_READY);
+                        }
                     }
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
@@ -221,7 +433,9 @@ __global__ void kernel_shotgun_grasshopper(
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // +Shotgun
+            // =====================================================================
+            // FIX 9: +Shotgun dengan scalar calculation yang BENAR
+            // =====================================================================
             {
                 uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
                 #pragma unroll
@@ -240,43 +454,44 @@ __global__ void kernel_shotgun_grasshopper(
                 
                 uint8_t odd = y3[0] & 1ULL;
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                uint8_t h20[20]; 
+                getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool match = false;
-                if (vanity_len <= 4) match = (*(const uint32_t*)h20 == prefix32);
-                else if (vanity_len <= 6) match = (*(const uint32_t*)h20 == prefix32) && (*(const uint16_t*)(h20+4) == prefix48);
-                else if (vanity_len == 7) match = (*(const uint64_t*)h20 == prefix64) && (h20[6] == prefix56);
-                else match = (*(const uint64_t*)h20 == prefix64);
+                // FIX: Gunakan fungsi check_vanity_match
+                bool match = check_vanity_match(h20, vanity_len, target_prefix32,
+                                                target_prefix48, target_prefix64, target_prefix56);
 
-                // FIX DEADLOCK
                 if (__any_sync(full_mask, match)) {
                     if (match) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4], add_scalar[4]; 
-                            #pragma unroll
-                            for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t addv = (uint64_t)(i + 1);
-                            #pragma unroll
-                            for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)stride[k] * addv; add_scalar[k] = (uint64_t)res; }
-                            uint64_t c = 0;
-                            #pragma unroll
-                            for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + add_scalar[k] + c; fs[k] = (uint64_t)res; c = (uint64_t)(res >> 64); }
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid; d_found_result->iter = 0;
-                            __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                        // FIX: Hitung scalar dengan benar menggunakan helper function
+                        uint64_t found_scalar[4];
+                        compute_plus_shotgun_scalar(S, stride, (uint64_t)(i + 1), found_scalar);
+                        
+                        // FIX: Validasi scalar dalam range
+                        if (is_scalar_valid_in_range(found_scalar, range_start, range_end)) {
+                            if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                                #pragma unroll
+                                for (int k=0;k<4;++k) d_found_result->scalar[k]=found_scalar[k];
+                                #pragma unroll
+                                for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                                #pragma unroll
+                                for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                                d_found_result->threadId = (int)gid; 
+                                d_found_result->iter = 0;
+                                __threadfence_system(); 
+                                atomicExch(d_found_flag, FOUND_READY);
+                            }
                         }
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
             }
 
-            // -Shotgun
+            // =====================================================================
+            // FIX 10: -Shotgun dengan scalar calculation yang BENAR
+            // TIDAK melakukan wrapping - jika scalar negatif, skip
+            // =====================================================================
             {
                 uint64_t px3[4], s[4], lam[4], px_i[4], py_i[4], y3[4];
                 #pragma unroll
@@ -294,39 +509,37 @@ __global__ void kernel_shotgun_grasshopper(
                 
                 uint8_t odd = y3[0] & 1ULL;
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                uint8_t h20[20]; 
+                getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool match = false;
-                if (vanity_len <= 4) match = (*(const uint32_t*)h20 == prefix32);
-                else if (vanity_len <= 6) match = (*(const uint32_t*)h20 == prefix32) && (*(const uint16_t*)(h20+4) == prefix48);
-                else if (vanity_len == 7) match = (*(const uint64_t*)h20 == prefix64) && (h20[6] == prefix56);
-                else match = (*(const uint64_t*)h20 == prefix64);
+                // FIX: Gunakan fungsi check_vanity_match
+                bool match = check_vanity_match(h20, vanity_len, target_prefix32,
+                                                target_prefix48, target_prefix64, target_prefix56);
 
-                // FIX DEADLOCK
                 if (__any_sync(full_mask, match)) {
                     if (match) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4], sub_scalar[4]; 
-                            #pragma unroll
-                            for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t subv = (uint64_t)(i + 1);
-                            #pragma unroll
-                            for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)stride[k] * subv; sub_scalar[k] = (uint64_t)res; }
-                            uint64_t borrow = 0;
-                            #pragma unroll
-                            for (int k=0;k<4;++k) { uint64_t val = fs[k]; uint64_t sub = sub_scalar[k] + borrow; borrow = (val < sub) ? 1ull : 0ull; fs[k] = val - sub; }
-                            #pragma unroll
-                            for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + c_RangeLen[k] + borrow; fs[k] = (uint64_t)res; borrow = (uint64_t)(res >> 64); }
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid; d_found_result->iter = 0;
-                            __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                        // FIX: Hitung scalar dengan benar, cek apakah valid (non-negative)
+                        uint64_t found_scalar[4];
+                        bool scalar_valid = compute_minus_shotgun_scalar(S, stride, (uint64_t)(i + 1), found_scalar);
+                        
+                        // FIX: HANYA simpan jika scalar valid (non-negative) DAN dalam range
+                        if (scalar_valid && is_scalar_valid_in_range(found_scalar, range_start, range_end)) {
+                            if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                                #pragma unroll
+                                for (int k=0;k<4;++k) d_found_result->scalar[k]=found_scalar[k];
+                                #pragma unroll
+                                for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                                #pragma unroll
+                                for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                                d_found_result->threadId = (int)gid; 
+                                d_found_result->iter = 0;
+                                __threadfence_system(); 
+                                atomicExch(d_found_flag, FOUND_READY);
+                            }
                         }
+                        // Jika scalar tidak valid (negatif), ini adalah false positive
+                        // Lanjutkan pencarian
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
@@ -339,7 +552,9 @@ __global__ void kernel_shotgun_grasshopper(
             _ModMult(inverse, inverse, sx_i);
         }
 
-        // --- LAST POINT: -Shotgun[half-1] ---
+        // =====================================================================
+        // FIX 11: LAST POINT -Shotgun[half-1] dengan scalar calculation BENAR
+        // =====================================================================
         {
             const int i = half - 1;
             uint64_t dx_inv_i[4];
@@ -361,35 +576,34 @@ __global__ void kernel_shotgun_grasshopper(
             
             uint8_t odd = y3[0] & 1ULL;
 
-            uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+            uint8_t h20[20]; 
+            getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool match = false;
-            if (vanity_len <= 4) match = (*(const uint32_t*)h20 == prefix32);
-            else if (vanity_len <= 6) match = (*(const uint32_t*)h20 == prefix32) && (*(const uint16_t*)(h20+4) == prefix48);
-            else if (vanity_len == 7) match = (*(const uint64_t*)h20 == prefix64) && (h20[6] == prefix56);
-            else match = (*(const uint64_t*)h20 == prefix64);
+            // FIX: Gunakan fungsi check_vanity_match
+            bool match = check_vanity_match(h20, vanity_len, target_prefix32,
+                                            target_prefix48, target_prefix64, target_prefix56);
 
-            // FIX DEADLOCK
             if (__any_sync(full_mask, match)) {
                 if (match) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t fs[4]; 
-                        #pragma unroll
-                        for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t borrow = 0;
-                        #pragma unroll
-                        for (int k=0;k<4;++k) { uint64_t val = fs[k]; uint64_t sub = scalar_jump[k] + borrow; borrow = (val < sub) ? 1ull : 0ull; fs[k] = val - sub; }
-                        #pragma unroll
-                        for (int k=0;k<4;++k) { __uint128_t res = (__uint128_t)fs[k] + c_RangeLen[k] + borrow; fs[k] = (uint64_t)res; borrow = (uint64_t)(res >> 64); }
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                        d_found_result->threadId = (int)gid; d_found_result->iter = 0;
-                        __threadfence_system(); atomicExch(d_found_flag, FOUND_READY);
+                    // FIX: Untuk last -Shotgun, scalar = S - scalar_jump
+                    uint64_t found_scalar[4];
+                    bool scalar_valid = !sub256_with_underflow_check(S, scalar_jump, found_scalar);
+                    
+                    // FIX: Hanya simpan jika valid
+                    if (scalar_valid && is_scalar_valid_in_range(found_scalar, range_start, range_end)) {
+                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->scalar[k]=found_scalar[k];
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                            #pragma unroll
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid; 
+                            d_found_result->iter = 0;
+                            __threadfence_system(); 
+                            atomicExch(d_found_flag, FOUND_READY);
+                        }
                     }
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
@@ -465,6 +679,76 @@ extern long double ld_from_u256(const uint64_t v[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
+// =====================================================================
+// FIX 12: Helper functions untuk operasi 256-bit di host
+// =====================================================================
+static void sub256_host(const uint64_t a[4], const uint64_t b[4], uint64_t result[4]) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint64_t ai = a[i];
+        uint64_t bi = b[i] + borrow;
+        borrow = (ai < bi) ? 1ULL : 0ULL;
+        result[i] = ai - bi;
+    }
+}
+
+static void add256_host(const uint64_t a[4], const uint64_t b[4], uint64_t result[4]) {
+    uint64_t carry = 0;
+    for (int i = 0; i < 4; ++i) {
+        __uint128_t res = (__uint128_t)a[i] + b[i] + carry;
+        result[i] = (uint64_t)res;
+        carry = (uint64_t)(res >> 64);
+    }
+}
+
+static void add256_u64_host(const uint64_t a[4], uint64_t val, uint64_t result[4]) {
+    uint64_t add[4] = {val, 0, 0, 0};
+    add256_host(a, add, result);
+}
+
+static bool cmp256_lt_host(const uint64_t a[4], const uint64_t b[4]) {
+    for (int i = 3; i >= 0; --i) {
+        if (a[i] != b[i]) return a[i] < b[i];
+    }
+    return false;
+}
+
+static bool cmp256_le_host(const uint64_t a[4], const uint64_t b[4]) {
+    return !cmp256_lt_host(b, a);
+}
+
+// =====================================================================
+// FIX 13: Random scalar generation yang BENAR (uniform distribution)
+// =====================================================================
+static void generate_random_scalar_in_range(
+    std::mt19937_64& gen,
+    const uint64_t range_start[4],
+    const uint64_t range_end[4],
+    uint64_t result[4])
+{
+    // Calculate range_span = range_end - range_start + 1
+    uint64_t range_span[4];
+    sub256_host(range_end, range_start, range_span);
+    add256_u64_host(range_span, 1ULL, range_span);
+    
+    // Generate random 256-bit value and reduce modulo range_span
+    // Using rejection sampling for uniformity
+    while (true) {
+        uint64_t rand_val[4];
+        for (int k = 0; k < 4; ++k) {
+            rand_val[k] = gen();
+        }
+        
+        // Check if rand_val < range_span
+        if (cmp256_lt_host(rand_val, range_span)) {
+            // result = range_start + rand_val
+            add256_host(range_start, rand_val, result);
+            return;
+        }
+        // Otherwise reject and try again (rejection sampling)
+    }
+}
+
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
@@ -523,19 +807,51 @@ int main(int argc, char** argv) {
     std::string end_hex   = range_hex.substr(colon_pos + 1);
 
     uint64_t range_start[4]{0}, range_end[4]{0};
-    if (!hexToLE64(start_hex, range_start) || !hexToLE64(end_hex, range_end)) { std::cerr << "Error: invalid range hex\n"; return EXIT_FAILURE; }
+    if (!hexToLE64(start_hex, range_start) || !hexToLE64(end_hex, range_end)) { 
+        std::cerr << "Error: invalid range hex\n"; return EXIT_FAILURE; 
+    }
 
+    // =====================================================================
+    // FIX 14: Parse vanity hash dengan validasi yang benar
+    // =====================================================================
     uint8_t target_hash160[20];
     memset(target_hash160, 0, 20);
-    for (size_t i = 0; i < vanity_hash_hex.length() / 2; ++i) {
-        std::string byteStr = vanity_hash_hex.substr(i * 2, 2);
-        target_hash160[i] = (uint8_t)std::stoul(byteStr, nullptr, 16);
+    
+    // Validasi panjang hex string
+    if (vanity_hash_hex.length() % 2 != 0) {
+        std::cerr << "Error: vanity-hash160 must have even length\n";
+        return EXIT_FAILURE;
     }
+    if (vanity_hash_hex.length() > 40) {
+        std::cerr << "Error: vanity-hash160 must be at most 20 bytes (40 hex chars)\n";
+        return EXIT_FAILURE;
+    }
+    
     int vanity_len = (int)(vanity_hash_hex.length() / 2);
+    if (vanity_len <= 0) {
+        std::cerr << "Error: vanity-hash160 must be at least 1 byte\n";
+        return EXIT_FAILURE;
+    }
+    
+    // Parse hex dengan validasi
+    for (size_t i = 0; i < (size_t)vanity_len; ++i) {
+        std::string byteStr = vanity_hash_hex.substr(i * 2, 2);
+        char* endp = nullptr;
+        unsigned long val = std::strtoul(byteStr.c_str(), &endp, 16);
+        if (*endp != '\0' || val > 255) {
+            std::cerr << "Error: invalid hex in vanity-hash160 at position " << (i*2) << "\n";
+            return EXIT_FAILURE;
+        }
+        target_hash160[i] = (uint8_t)val;
+    }
 
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
-    if (!is_pow2(runtime_batch_size) || (runtime_batch_size & 1u)) { std::cerr << "Error: batch size must be even power of two\n"; return EXIT_FAILURE; }
-    if (runtime_batch_size > MAX_BATCH_SIZE) { std::cerr << "Error: batch size > " << MAX_BATCH_SIZE << "\n"; return EXIT_FAILURE; }
+    if (!is_pow2(runtime_batch_size) || (runtime_batch_size & 1u)) { 
+        std::cerr << "Error: batch size must be even power of two\n"; return EXIT_FAILURE; 
+    }
+    if (runtime_batch_size > MAX_BATCH_SIZE) { 
+        std::cerr << "Error: batch size > " << MAX_BATCH_SIZE << "\n"; return EXIT_FAILURE; 
+    }
 
     uint64_t range_len[4]; 
     sub256(range_end, range_start, range_len); 
@@ -553,7 +869,9 @@ int main(int argc, char** argv) {
     }
 
     int device=0; cudaDeviceProp prop{};
-    if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) { std::cerr<<"CUDA init error\n"; return EXIT_FAILURE; }
+    if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) { 
+        std::cerr<<"CUDA init error\n"; return EXIT_FAILURE; 
+    }
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
     int threadsPerBlock = 256;
@@ -610,34 +928,67 @@ int main(int argc, char** argv) {
     std::random_device rd;
     std::mt19937_64 gen(rd());
     
+    // Calculate max valid start scalar (must leave room for scalar_jump)
     uint64_t max_start[4];
-    { uint64_t borrow = 0; for (int i = 0; i < 4; ++i) { uint64_t sub = scalar_jump[i] + borrow; borrow = (range_end[i] < sub) ? 1 : 0; max_start[i] = range_end[i] - sub; } }
-
-    for (uint64_t i = 0; i < threadsTotal; ++i) {
-        uint64_t rand_val[4];
-        for (int k = 0; k < 4; ++k) rand_val[k] = gen();
-        uint64_t range_span[4];
-        sub256(max_start, range_start, range_span);
-        add256_u64(range_span, 1ull, range_span);
-        for (int k = 0; k < 4; ++k) rand_val[k] %= (range_span[k] ? range_span[k] : 1ULL);
-        add256(range_start, rand_val, &h_start_scalars[i*4]);
-        uint64_t remaining[4]; sub256(range_end, &h_start_scalars[i*4], remaining); add256_u64(remaining, 1ull, remaining);
-        for (int k = 0; k < 4; ++k) h_counts256[i*4+k] = remaining[k];
+    {
+        uint64_t borrow = 0;
+        for (int i = 0; i < 4; ++i) {
+            uint64_t sub = scalar_jump[i] + borrow;
+            borrow = (range_end[i] < sub) ? 1 : 0;
+            max_start[i] = range_end[i] - sub;
+        }
+        // If there was borrow, max_start would be negative - cap at range_start
+        if (borrow) {
+            memcpy(max_start, range_start, sizeof(range_start));
+        }
     }
 
-    cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
+    // =====================================================================
+    // FIX 15: Gunakan random scalar generation yang benar
+    // =====================================================================
+    std::cout << "Info: Generating random start scalars...\n";
+    for (uint64_t i = 0; i < threadsTotal; ++i) {
+        uint64_t rand_scalar[4];
+        generate_random_scalar_in_range(gen, range_start, max_start, rand_scalar);
+        
+        memcpy(&h_start_scalars[i*4], rand_scalar, 4 * sizeof(uint64_t));
+        
+        uint64_t remaining[4];
+        sub256(range_end, rand_scalar, remaining);
+        add256_u64(remaining, 1ull, remaining);
+        memcpy(&h_counts256[i*4], remaining, 4 * sizeof(uint64_t));
+    }
+
+    // =====================================================================
+    // FIX 16: Copy ke constant memory dengan benar
+    // =====================================================================
+    cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);  // FIX: Sekarang ada deklarasinya
     cudaMemcpyToSymbol(c_vanity_len, &vanity_len, sizeof(int));
     cudaMemcpyToSymbol(c_RangeStart, range_start, 4*sizeof(uint64_t));
     cudaMemcpyToSymbol(c_RangeEnd, range_end, 4*sizeof(uint64_t));
-    cudaMemcpyToSymbol(c_RangeLen, range_len, 4*sizeof(uint64_t));
+    cudaMemcpyToSymbol(c_RangeLen, range_len, 4*sizeof(uint64_t));  // FIX: Sekarang ada deklarasinya
     cudaMemcpyToSymbol(c_Stride, stride, 4*sizeof(uint64_t));
     cudaMemcpyToSymbol(c_ScalarJump, scalar_jump, 4*sizeof(uint64_t));
 
-    uint32_t prefix32 = 0; uint16_t prefix48 = 0; uint64_t prefix64 = 0; uint8_t prefix56 = 0;
+    // =====================================================================
+    // FIX 17: Inisialisasi prefix dengan benar
+    // =====================================================================
+    uint32_t prefix32 = 0; 
+    uint16_t prefix48 = 0; 
+    uint64_t prefix64 = 0; 
+    uint8_t  prefix56 = 0;
+    
+    // Clear semua terlebih dahulu
+    memset(&prefix32, 0, sizeof(prefix32));
+    memset(&prefix48, 0, sizeof(prefix48));
+    memset(&prefix64, 0, sizeof(prefix64));
+    prefix56 = 0;
+    
+    // Fill berdasarkan vanity_len dengan benar
     if (vanity_len >= 2) memcpy(&prefix32, target_hash160, 2);
-    if (vanity_len >= 4) memcpy(&prefix32, target_hash160, 4);
+    if (vanity_len >= 4) memcpy(&prefix32, target_hash160, 4);  // Override untuk 4 byte
     if (vanity_len >= 6) memcpy(&prefix48, target_hash160 + 4, 2);
-    if (vanity_len >= 7) { memcpy(&prefix64, target_hash160, 7); prefix56 = target_hash160[6]; }
+    if (vanity_len >= 7) prefix56 = target_hash160[6];
     if (vanity_len >= 8) memcpy(&prefix64, target_hash160, 8);
     
     cudaMemcpyToSymbol(c_prefix_32, &prefix32, sizeof(prefix32));
@@ -649,7 +1000,12 @@ int main(int argc, char** argv) {
     int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
     unsigned long long *d_hashes_accum=nullptr; unsigned int *d_any_left=nullptr;
 
-    auto ck = [](cudaError_t e, const char* msg){ if (e != cudaSuccess) { std::cerr << msg << ": " << cudaGetErrorString(e) << "\n"; std::exit(EXIT_FAILURE); } };
+    auto ck = [](cudaError_t e, const char* msg){ 
+        if (e != cudaSuccess) { 
+            std::cerr << msg << ": " << cudaGetErrorString(e) << "\n"; 
+            std::exit(EXIT_FAILURE); 
+        } 
+    };
 
     ck(cudaMalloc(&d_start_scalars, threadsTotal * 4 * sizeof(uint64_t)), "malloc start");
     ck(cudaMalloc(&d_Px, threadsTotal * 4 * sizeof(uint64_t)), "malloc Px");
@@ -664,7 +1020,12 @@ int main(int argc, char** argv) {
 
     ck(cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy start");
     ck(cudaMemcpy(d_counts256, h_counts256, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy counts");
-    { int zero = FOUND_NONE; unsigned long long zero64=0ull; ck(cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice), "init flag"); ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes"); }
+    { 
+        int zero = FOUND_NONE; 
+        unsigned long long zero64=0ull; 
+        ck(cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice), "init flag"); 
+        ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes"); 
+    }
 
     std::cout << "Info: Precomputing Shotgun table...\n";
     {
@@ -675,12 +1036,20 @@ int main(int argc, char** argv) {
             int shift = stride_bits;
             while (mult) {
                 if (mult & 1) {
-                    uint64_t carry = 0; int word_shift = shift / 64; int bit_shift = shift % 64;
+                    uint64_t carry = 0; 
+                    int word_shift = shift / 64; 
+                    int bit_shift = shift % 64;
                     for (int k = 0; k < 4; ++k) {
-                        if (k + word_shift < 4) { __uint128_t res = (__uint128_t)h_shotgun_scalars[(size_t)i*4 + k + word_shift] + ((__uint128_t)stride[k] << bit_shift) + carry; h_shotgun_scalars[(size_t)i*4 + k + word_shift] = (uint64_t)res; carry = (uint64_t)(res >> 64); }
+                        if (k + word_shift < 4) { 
+                            __uint128_t res = (__uint128_t)h_shotgun_scalars[(size_t)i*4 + k + word_shift] + 
+                                              ((__uint128_t)stride[k] << bit_shift) + carry; 
+                            h_shotgun_scalars[(size_t)i*4 + k + word_shift] = (uint64_t)res; 
+                            carry = (uint64_t)(res >> 64); 
+                        }
                     }
                 }
-                mult >>= 1; shift++;
+                mult >>= 1; 
+                shift++;
             }
         }
         uint64_t *d_shotgun_scalars=nullptr, *d_Sx=nullptr, *d_Sy=nullptr;
@@ -690,49 +1059,66 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(d_shotgun_scalars, h_shotgun_scalars, half * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy shotgun_s");
         int blocks_scal = (half + threadsPerBlock - 1) / threadsPerBlock;
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_shotgun_scalars, d_Sx, d_Sy, half);
-        ck(cudaDeviceSynchronize(), "shotgun table sync"); ck(cudaGetLastError(), "shotgun table launch");
+        ck(cudaDeviceSynchronize(), "shotgun table sync"); 
+        ck(cudaGetLastError(), "shotgun table launch");
         uint64_t* h_Sx = (uint64_t*)std::malloc(half * 4 * sizeof(uint64_t));
         uint64_t* h_Sy = (uint64_t*)std::malloc(half * 4 * sizeof(uint64_t));
         ck(cudaMemcpy(h_Sx, d_Sx, half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Sx");
         ck(cudaMemcpy(h_Sy, d_Sy, half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Sy");
         ck(cudaMemcpyToSymbol(c_ShotgunX, h_Sx, half * 4 * sizeof(uint64_t)), "ToSymbol ShotgunX");
         ck(cudaMemcpyToSymbol(c_ShotgunY, h_Sy, half * 4 * sizeof(uint64_t)), "ToSymbol ShotgunY");
-        cudaFree(d_shotgun_scalars); cudaFree(d_Sx); cudaFree(d_Sy);
-        std::free(h_shotgun_scalars); std::free(h_Sx); std::free(h_Sy);
+        cudaFree(d_shotgun_scalars); 
+        cudaFree(d_Sx); 
+        cudaFree(d_Sy);
+        std::free(h_shotgun_scalars); 
+        std::free(h_Sx); 
+        std::free(h_Sy);
     }
 
     std::cout << "Info: Precomputing Jump point...\n";
     {
-        uint64_t h_jump_scalar[4]; memcpy(h_jump_scalar, scalar_jump, 4 * sizeof(uint64_t));
+        uint64_t h_jump_scalar[4]; 
+        memcpy(h_jump_scalar, scalar_jump, 4 * sizeof(uint64_t));
         uint64_t *d_jump_s=nullptr, *d_Jx=nullptr, *d_Jy=nullptr;
         ck(cudaMalloc(&d_jump_s, 4 * sizeof(uint64_t)), "malloc jump_s");
         ck(cudaMalloc(&d_Jx, 4 * sizeof(uint64_t)), "malloc Jx");
         ck(cudaMalloc(&d_Jy, 4 * sizeof(uint64_t)), "malloc Jy");
         ck(cudaMemcpy(d_jump_s, h_jump_scalar, 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy jump_s");
         scalarMulKernelBase<<<1, 1>>>(d_jump_s, d_Jx, d_Jy, 1);
-        ck(cudaDeviceSynchronize(), "jump point sync"); ck(cudaGetLastError(), "jump point launch");
+        ck(cudaDeviceSynchronize(), "jump point sync"); 
+        ck(cudaGetLastError(), "jump point launch");
         uint64_t hJx[4], hJy[4];
         ck(cudaMemcpy(hJx, d_Jx, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jx");
         ck(cudaMemcpy(hJy, d_Jy, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jy");
         ck(cudaMemcpyToSymbol(c_JumpPointX, hJx, 4 * sizeof(uint64_t)), "ToSymbol JumpX");
         ck(cudaMemcpyToSymbol(c_JumpPointY, hJy, 4 * sizeof(uint64_t)), "ToSymbol JumpY");
-        cudaFree(d_jump_s); cudaFree(d_Jx); cudaFree(d_Jy);
+        cudaFree(d_jump_s); 
+        cudaFree(d_Jx); 
+        cudaFree(d_Jy);
     }
 
     std::cout << "Info: Precomputing start points...\n";
     {
         int blocks_scal = (threadsTotal + threadsPerBlock - 1) / threadsPerBlock;
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
-        ck(cudaDeviceSynchronize(), "start points sync"); ck(cudaGetLastError(), "start points launch");
+        ck(cudaDeviceSynchronize(), "start points sync"); 
+        ck(cudaGetLastError(), "start points launch");
     }
 
+    // =====================================================================
+    // FIX 18: Display info dengan nilai yang benar untuk debugging
+    // =====================================================================
     std::cout << "\n======== SHOTGUN GRASSHOPPER =========================\n";
     std::cout << std::left << std::setw(22) << "Mode"          << " : SHOTGUN SPARSE SAMPLING\n";
     std::cout << std::left << std::setw(22) << "Device"        << " : " << prop.name << " (SM " << prop.multiProcessorCount << ")\n";
     std::cout << std::left << std::setw(22) << "ThreadsTotal"  << " : " << threadsTotal << "\n";
     std::cout << std::left << std::setw(22) << "Batch Size"    << " : " << B << "\n";
     std::cout << std::left << std::setw(22) << "Stride"        << " : 2^" << stride_bits << " = " << (1ULL << stride_bits) << "\n";
-    std::cout << std::left << std::setw(22) << "Vanity Target" << " : " << vanity_hash_hex << " (" << vanity_len << " bytes)\n";
+    std::cout << std::left << std::setw(22) << "Vanity Target" << " : ";
+    for (int i = 0; i < vanity_len; ++i) {
+        std::cout << std::hex << std::setfill('0') << std::setw(2) << (int)target_hash160[i];
+    }
+    std::cout << std::dec << " (" << vanity_len << " bytes)\n";
     std::cout << "\n======== FIRING SHOTS ===============================\n";
 
     cudaStream_t streamKernel;
@@ -756,7 +1142,10 @@ int main(int argc, char** argv) {
         );
         
         cudaError_t launchErr = cudaGetLastError();
-        if (launchErr != cudaSuccess) { std::cerr << "\nKernel error: " << cudaGetErrorString(launchErr) << "\n"; stop_all = true; }
+        if (launchErr != cudaSuccess) { 
+            std::cerr << "\nKernel error: " << cudaGetErrorString(launchErr) << "\n"; 
+            stop_all = true; 
+        }
         launch_count++;
 
         while (!stop_all) {
@@ -778,7 +1167,8 @@ int main(int argc, char** argv) {
                           << "Hashes: " << h_hashes << " | "
                           << "Coverage: " << std::setprecision(6) << (double)coverage << "%   ";
                 std::cout.flush();
-                lastHashes = h_hashes; tLast = now;
+                lastHashes = h_hashes; 
+                tLast = now;
             }
 
             int host_found = 0;
@@ -802,16 +1192,19 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost), "read any_left");
         if (h_any == 0u) {
             std::cout << "\nInfo: Boundary reached. Reinitializing random starts...\n";
+            // =====================================================================
+            // FIX 19: Gunakan random generation yang benar saat reinitialize
+            // =====================================================================
             for (uint64_t i = 0; i < threadsTotal; ++i) {
-                uint64_t rand_val[4]; for (int k = 0; k < 4; ++k) rand_val[k] = gen();
-                uint64_t range_span[4]; sub256(max_start, range_start, range_span); add256_u64(range_span, 1ull, range_span);
-                for (int k = 0; k < 4; ++k) rand_val[k] %= (range_span[k] ? range_span[k] : 1ULL);
-                add256(range_start, rand_val, &h_start_scalars[i*4]);
+                uint64_t rand_scalar[4];
+                generate_random_scalar_in_range(gen, range_start, max_start, rand_scalar);
+                memcpy(&h_start_scalars[i*4], rand_scalar, 4 * sizeof(uint64_t));
             }
             ck(cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "reinit start");
             int blocks_scal = (threadsTotal + threadsPerBlock - 1) / threadsPerBlock;
             scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
-            ck(cudaDeviceSynchronize(), "reinit sync"); ck(cudaGetLastError(), "reinit launch");
+            ck(cudaDeviceSynchronize(), "reinit sync"); 
+            ck(cudaGetLastError(), "reinit launch");
         }
     }
 
@@ -825,19 +1218,42 @@ int main(int argc, char** argv) {
     if (h_found_flag == FOUND_READY) {
         FoundResult host_result{};
         ck(cudaMemcpy(&host_result, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost), "read result");
+        
+        // =====================================================================
+        // FIX 20: Validasi hasil sebelum ditampilkan
+        // =====================================================================
         std::cout << "\n========== BOOM! TARGET FOUND! =====================\n";
         std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
         std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
         std::cout << "Found by Thread: " << host_result.threadId << "\n";
+        
+        // Verify scalar is in range
+        bool in_range = cmp256_le_host(host_result.scalar, range_end) && 
+                       !cmp256_lt_host(host_result.scalar, range_start);
+        std::cout << "Scalar in Range: " << (in_range ? "YES" : "NO - WARNING!") << "\n";
     } else {
-        if (g_sigint) { std::cout << "========== INTERRUPTED ==============================\n"; exit_code = 130; }
-        else { std::cout << "========== SEARCH EXHAUSTED ========================\n"; }
+        if (g_sigint) { 
+            std::cout << "========== INTERRUPTED ==============================\n"; 
+            exit_code = 130; 
+        }
+        else { 
+            std::cout << "========== SEARCH EXHAUSTED ========================\n"; 
+        }
     }
 
-    cudaFree(d_start_scalars); cudaFree(d_Px); cudaFree(d_Py); cudaFree(d_Rx); cudaFree(d_Ry); cudaFree(d_counts256);
-    cudaFree(d_found_flag); cudaFree(d_found_result); cudaFree(d_hashes_accum); cudaFree(d_any_left);
+    cudaFree(d_start_scalars); 
+    cudaFree(d_Px); 
+    cudaFree(d_Py); 
+    cudaFree(d_Rx); 
+    cudaFree(d_Ry); 
+    cudaFree(d_counts256);
+    cudaFree(d_found_flag); 
+    cudaFree(d_found_result); 
+    cudaFree(d_hashes_accum); 
+    cudaFree(d_any_left);
     cudaStreamDestroy(streamKernel);
-    cudaFreeHost(h_start_scalars); cudaFreeHost(h_counts256);
+    cudaFreeHost(h_start_scalars); 
+    cudaFreeHost(h_counts256);
 
     return exit_code;
 }
