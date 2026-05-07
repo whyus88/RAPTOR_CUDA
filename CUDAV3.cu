@@ -75,7 +75,7 @@ __constant__ uint64_t c_prefix_64;
 // =====================================================
 // SHOTGUN KERNEL
 // =====================================================
-__launch_bounds__(256, 4) 
+__launch_bounds__(256, 2) 
 __global__ void kernel_shotgun_grasshopper(
     const uint64_t* __restrict__ Px,
     const uint64_t* __restrict__ Py,
