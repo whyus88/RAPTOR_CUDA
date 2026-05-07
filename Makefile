@@ -1,5 +1,5 @@
 TARGET      := CMK
-SRC         := CUDA2.cu CUDAHash.cu
+SRC         := CUDAV3.cu CUDAHash.cu
 OBJ         := $(SRC:.cu=.o)
 CC          := nvcc
 
